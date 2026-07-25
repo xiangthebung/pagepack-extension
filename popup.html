@@ -23,19 +23,19 @@
         <button id="plan-chip" class="plan-chip" type="button">Free</button>
       </header>
 
-      <nav class="tabs" aria-label="PagePack sections">
-        <button class="tab is-active" id="save-tab" type="button">
+      <nav class="tabs" role="tablist" aria-label="PagePack sections">
+        <button class="tab is-active" id="save-tab" role="tab" aria-selected="true" aria-controls="save-view" tabindex="0" type="button">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19.5h14M12 3.5v11m0 0-4-4m4 4 4-4"/></svg>
           <span>Save</span>
         </button>
-        <button class="tab" id="library-tab" type="button">
+        <button class="tab" id="library-tab" role="tab" aria-selected="false" aria-controls="library-view" tabindex="-1" type="button">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 7.5h15v12h-15zM7.5 4.5h9M8.5 11.5h7"/></svg>
           <span>Library</span>
         </button>
       </nav>
 
       <main class="view-panel">
-        <section id="save-view" class="view" aria-labelledby="save-tab">
+        <section id="save-view" class="view" role="tabpanel" aria-labelledby="save-tab">
           <div class="section-intro">
             <h1>Save for later</h1>
             <p>Keep a private copy you can open without a connection.</p>
@@ -83,7 +83,7 @@
                   <label class="setting-copy" for="save-folder"><strong>Save to</strong><small>Choose a folder</small></label>
                   <div class="folder-picker" id="folder-picker">
                     <input id="save-folder" type="hidden" value="">
-                    <button id="save-folder-trigger" class="folder-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="save-folder-label">
+                    <button id="save-folder-trigger" class="folder-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="save-folder-menu" aria-labelledby="save-folder-label">
                       <span id="save-folder-label">Library</span>
                       <span class="select-chevron" aria-hidden="true"></span>
                     </button>
@@ -142,7 +142,7 @@
           </section>
         </section>
 
-        <section id="library-view" class="view" aria-labelledby="library-tab" hidden>
+        <section id="library-view" class="view" role="tabpanel" aria-labelledby="library-tab" hidden>
           <div class="library-heading">
             <div class="heading-line">
               <div>

@@ -36,7 +36,21 @@ html, body {
 }
 
 body { overflow-y: auto; scrollbar-width: none; }
-body::-webkit-scrollbar { display: none; width: 0; height: 0; }
+body.is-dialog-open { overflow: hidden; overscroll-behavior: none; }
+body::-webkit-scrollbar,
+.folder-menu::-webkit-scrollbar,
+.journey-pages::-webkit-scrollbar,
+.journey-review-list::-webkit-scrollbar,
+.pro-modal::-webkit-scrollbar,
+.issues-modal::-webkit-scrollbar,
+.issues-list::-webkit-scrollbar { display: none; width: 0; height: 0; }
+body,
+.folder-menu,
+.journey-pages,
+.journey-review-list,
+.pro-modal,
+.issues-modal,
+.issues-list { scrollbar-width: none; overscroll-behavior: contain; }
 button, input, select { font: inherit; }
 button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 button:disabled { cursor: not-allowed; opacity: .48; }
@@ -311,6 +325,8 @@ body.is-reordering, body.is-reordering * { cursor: grabbing !important; user-sel
 .issues-actions { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
 .issues-actions .secondary-button { flex: 1; margin-top: 0; }
 .issues-actions .link-button { flex: 0 0 auto; margin: 0 8px 0 0; }
+
+button:focus-visible, select:focus-visible { outline: 3px solid rgba(0, 122, 255, .24) !important; outline-offset: 2px; }
 
 @media (prefers-color-scheme: dark) {
   :root {

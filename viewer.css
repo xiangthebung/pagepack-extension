@@ -20,6 +20,7 @@
 * { box-sizing: border-box; }
 html, body { min-height: 100%; margin: 0; background: var(--bg); color: var(--text); }
 button { font: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+button:focus-visible { outline: 3px solid rgba(0, 122, 255, .26) !important; outline-offset: 2px; }
 svg { display: block; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 [hidden] { display: none !important; }
 #reader-main { width: 100%; min-height: 100vh; padding: 0; }
@@ -63,7 +64,7 @@ svg { display: block; fill: none; stroke: currentColor; stroke-linecap: round; s
 @keyframes loader-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
 @media (prefers-reduced-motion: no-preference) { .loader { animation: loader-float 1.8s ease-in-out infinite; } }
 @media (prefers-reduced-motion: reduce) { .reader-fallback-note.is-closing { animation: none; opacity: 0; } }
-@media (max-width: 560px) { .reader-fallback-note { top: 10px; right: 8px; left: 8px; justify-content: flex-end; } .reader-link-legend { top: 10px; left: 8px; } .reader-unsaved-note { top: 60px; right: 8px; left: 8px; flex-wrap: wrap; } .reader-unsaved-copy { flex: 1 1 100%; } .reader-unsaved-copy span { max-width: none; } .reader-unsaved-action { flex: 1; } }
+@media (max-width: 560px) { .reader-fallback-note { top: 52px; right: 8px; left: 8px; justify-content: flex-end; } .reader-link-legend { top: 10px; left: 8px; } .reader-unsaved-note { top: 100px; right: 8px; left: 8px; flex-wrap: wrap; } .reader-unsaved-copy { flex: 1 1 100%; } .reader-unsaved-copy span { max-width: none; } .reader-unsaved-action { flex: 1; } }
 
 @media (prefers-color-scheme: dark) {
   :root { color-scheme: dark; --bg: #1c1c1e; --surface: rgba(44,44,46,.94); --surface-solid: #2c2c2e; --surface-muted: #3a3a3c; --separator: rgba(84,84,88,.62); --text: #f5f5f7; --secondary: rgba(235,235,245,.66); --tertiary: rgba(235,235,245,.38); --blue: #0a84ff; --blue-soft: rgba(10,132,255,.18); --danger: #ff453a; --danger-soft: rgba(255,69,58,.15); }

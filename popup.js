@@ -215,15 +215,16 @@ function setSelectedFolder(id, closeMenu = true) {
     option.classList.toggle("is-selected", isSelected);
     option.setAttribute("aria-selected", String(isSelected));
   });
-  if (closeMenu) closeFolderMenu();
+  if (closeMenu) closeFolderMenu(true);
   persistCapturePreferences();
 }
 
-function closeFolderMenu() {
+function closeFolderMenu(restoreFocus = false) {
   const trigger = $("#save-folder-trigger");
   const menu = $("#save-folder-menu");
   menu.hidden = true;
   trigger.setAttribute("aria-expanded", "false");
+  if (restoreFocus) trigger.focus();
 }
 
 function toggleFolderMenu(force) {
@@ -1305,16 +1306,51 @@ async function openProPage(mode = "checkout", triggerButton = null) {
   }
 }
 
+const DIALOG_SELECTORS = ["#pro-overlay", "#issues-overlay", "#journey-review-overlay"];
+
+function openDialog() {
+  document.body.classList.add("is-dialog-open");
+}
+
+function closeDialog() {
+  if (DIALOG_SELECTORS.every((selector) => $(selector).hidden)) document.body.classList.remove("is-dialog-open");
+}
+
+function trapDialogFocus(event) {
+  const dialog = DIALOG_SELECTORS.map((selector) => $(selector)).find((overlay) => overlay && !overlay.hidden);
+  if (!dialog) return;
+  const focusable = [...dialog.querySelectorAll("button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])")]
+    .filter((node) => !node.disabled && !node.hidden && node.getClientRects().length > 0);
+  if (!focusable.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (!dialog.contains(document.activeElement)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  } else if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 function openProOverlay() {
   proOverlayRestoreFocus = document.activeElement;
   $("#pro-overlay").hidden = false;
   document.body.classList.add("is-pro-open");
+  openDialog();
   requestAnimationFrame(() => $("#close-pro-button").focus());
 }
 
 function closeProOverlay() {
   $("#pro-overlay").hidden = true;
   document.body.classList.remove("is-pro-open");
+  closeDialog();
   if (proOverlayRestoreFocus?.focus) proOverlayRestoreFocus.focus();
   proOverlayRestoreFocus = null;
 }
@@ -1430,11 +1466,13 @@ function openIssuesOverlay(packId) {
   issuesOverlayRestoreFocus = document.activeElement;
   renderIssueReport(pack);
   $("#issues-overlay").hidden = false;
+  openDialog();
   requestAnimationFrame(() => $("#close-issues-button").focus());
 }
 
 function closeIssuesOverlay() {
   $("#issues-overlay").hidden = true;
+  closeDialog();
   if (issuesOverlayRestoreFocus?.focus) issuesOverlayRestoreFocus.focus();
   issuesOverlayRestoreFocus = null;
   issueReportPack = null;
@@ -1550,6 +1588,10 @@ function showView(name) {
   libraryView.setAttribute("aria-hidden", String(!libraryActive));
   $("#save-tab").classList.toggle("is-active", saveActive);
   $("#library-tab").classList.toggle("is-active", libraryActive);
+  $("#save-tab").setAttribute("aria-selected", String(saveActive));
+  $("#library-tab").setAttribute("aria-selected", String(libraryActive));
+  $("#save-tab").tabIndex = saveActive ? 0 : -1;
+  $("#library-tab").tabIndex = libraryActive ? 0 : -1;
   if (libraryActive) renderLibrary();
 }
 
@@ -1743,6 +1785,7 @@ function openJourneyReview() {
     list.append(row);
   });
   $("#journey-review-overlay").hidden = false;
+  openDialog();
   $("#journey-finish-button").disabled = true;
   $("#journey-discard-button").disabled = true;
   requestAnimationFrame(() => $("#save-reviewed-journey-button").focus());
@@ -1765,6 +1808,7 @@ function closeJourneyReview(force = false) {
   if (journeySaveInFlight && !force) return;
   setJourneyReviewBusy(false);
   $("#journey-review-overlay").hidden = true;
+  closeDialog();
   journeyReviewId = null;
   if (journeyReviewRestoreFocus?.focus) journeyReviewRestoreFocus.focus();
   journeyReviewRestoreFocus = null;
@@ -1790,6 +1834,7 @@ async function saveActiveJourney(excludedUrls = []) {
     setStatus(error.message, true);
     await loadLibraryData();
     setJourneyReviewBusy(false);
+    closeDialog();
     button.disabled = false;
   }
 }
@@ -2069,6 +2114,21 @@ chrome.runtime.onMessage.addListener((message) => {
 
 $("#save-tab").addEventListener("click", () => showView("save"));
 $("#library-tab").addEventListener("click", () => showView("library"));
+$(".tabs").addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const tabs = [...$(".tabs").querySelectorAll('[role="tab"]')];
+  const current = tabs.indexOf(event.target.closest('[role="tab"]'));
+  if (current < 0) return;
+  event.preventDefault();
+  const nextIndex = event.key === "Home"
+    ? 0
+    : event.key === "End"
+      ? tabs.length - 1
+      : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+  const nextTab = tabs[nextIndex];
+  showView(nextTab.id === "library-tab" ? "library" : "save");
+  nextTab.focus();
+});
 $("#plan-chip").addEventListener("click", openProOverlay);
 $("#close-pro-button").addEventListener("click", closeProOverlay);
 $("#pro-overlay").addEventListener("click", (event) => {
@@ -2112,15 +2172,40 @@ window.addEventListener("offline", applyOnlineState);
 window.addEventListener("online", applyOnlineState);
 $("#save-folder-trigger").addEventListener("click", () => toggleFolderMenu());
 $("#save-folder-trigger").addEventListener("keydown", (event) => {
-  if (["ArrowDown", "Enter", " "].includes(event.key)) {
+  if (event.key === "ArrowDown") {
     event.preventDefault();
     toggleFolderMenu(true);
   }
-  if (event.key === "Escape") closeFolderMenu();
+  if (event.key === "Escape") closeFolderMenu(true);
 });
 $("#save-folder-menu").addEventListener("click", (event) => {
   const option = event.target.closest(".folder-option");
   if (option) setSelectedFolder(option.dataset.folderId);
+});
+$("#save-folder-menu").addEventListener("keydown", (event) => {
+  const options = [...$("#save-folder-menu").querySelectorAll(".folder-option")];
+  const currentOption = event.target.closest(".folder-option");
+  const selectedOption = $("#save-folder-menu").querySelector(".folder-option.is-selected");
+  const currentIndex = Math.max(0, options.indexOf(currentOption || selectedOption));
+  if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+    event.preventDefault();
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? options.length - 1
+        : (currentIndex + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+    options[nextIndex]?.focus();
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeFolderMenu(true);
+    return;
+  }
+  if (["Enter", " "].includes(event.key) && currentOption) {
+    event.preventDefault();
+    setSelectedFolder(currentOption.dataset.folderId);
+  }
 });
 document.addEventListener("click", (event) => {
   if (!$("#folder-picker").contains(event.target)) closeFolderMenu();
@@ -2162,6 +2247,7 @@ document.addEventListener("pointermove", handleReorderPointerMove, { passive: fa
 document.addEventListener("pointerup", handleReorderPointerUp, { passive: false });
 document.addEventListener("pointercancel", handleReorderPointerCancel);
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Tab") trapDialogFocus(event);
   if (event.key === "Escape" && dragSession?.mode === "pointer") cancelPointerDrag();
   if (event.key === "Escape" && !$("#issues-overlay").hidden) closeIssuesOverlay();
   if (event.key === "Escape" && !$("#journey-review-overlay").hidden) closeJourneyReview();
