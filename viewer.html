@@ -7,26 +7,68 @@
     <link rel="stylesheet" href="viewer.css">
   </head>
   <body>
+    <header id="reader-bar" class="reader-bar" hidden>
+      <button id="reader-library-button" class="bar-button bar-button-quiet" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 6l-6 6 6 6"/></svg>
+        <span>Library</span>
+      </button>
+
+      <div class="reader-identity">
+        <strong id="reader-title">Saved page</strong>
+        <span id="reader-subtitle"></span>
+      </div>
+
+      <div id="reader-nav" class="reader-nav" hidden>
+        <button id="reader-prev" class="bar-icon" type="button" aria-label="Previous page in this save">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 6l-6 6 6 6"/></svg>
+        </button>
+        <button id="reader-page-button" class="bar-button bar-button-quiet" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="reader-page-menu">
+          <span id="reader-page-label">1 of 1</span>
+        </button>
+        <button id="reader-next" class="bar-icon" type="button" aria-label="Next page in this save">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 6l6 6-6 6"/></svg>
+        </button>
+      </div>
+
+      <button id="reader-scripts-button" class="bar-button bar-button-quiet" type="button" hidden>Enable scripts</button>
+      <button id="reader-open-original" class="bar-button" type="button">Open online</button>
+    </header>
+
+    <div id="reader-page-menu" class="reader-page-menu" role="listbox" aria-label="Pages in this save" hidden></div>
+
     <main id="reader-main" hidden>
-      <aside id="reader-link-legend" class="reader-link-legend" role="status" hidden>Links marked “Saved” are available offline</aside>
+      <aside id="reader-link-legend" class="reader-toast" role="status" hidden>Links marked “Saved” open offline</aside>
       <aside id="reader-unsaved-note" class="reader-unsaved-note" role="alert" hidden>
         <div class="reader-unsaved-copy">
-          <strong>This page is not saved</strong>
-          <span id="reader-unsaved-url">Save it with Journey or Depth while online.</span>
+          <strong>That page isn’t in this save</strong>
+          <span id="reader-unsaved-url"></span>
         </div>
-        <button id="reader-open-link-button" class="reader-unsaved-action reader-unsaved-open" type="button">Open online</button>
-        <button id="reader-dismiss-unsaved-button" class="reader-unsaved-dismiss" type="button" aria-label="Dismiss notice"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg></button>
+        <button id="reader-open-link-button" class="bar-button" type="button">Open online</button>
+        <button id="reader-dismiss-unsaved-button" class="bar-icon" type="button" aria-label="Dismiss">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg>
+        </button>
       </aside>
-      <aside id="reader-fallback-note" class="reader-fallback-note" role="status" hidden>
-        <button id="try-scripts-button" class="fallback-note-action" type="button" title="Try this page with its saved scripts. Refresh to restore the static view." hidden>Enable scripts</button>
-        <button id="script-info-button" class="script-info-button" type="button" aria-label="Why scripts are optional" aria-describedby="script-info-tooltip" title="Scripts can restore interactive features, but may change the saved page.">i</button>
-        <span id="script-info-tooltip" class="script-info-tooltip" role="tooltip">Scripts power dynamic content and interactions, but may be unreliable offline. Refresh to return to the static snapshot.</span>
-        <button id="dismiss-fallback-note" class="fallback-note-dismiss" type="button" aria-label="Dismiss notice"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg></button>
-      </aside>
-      <iframe id="reader-frame" title="Saved page" sandbox="allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin"></iframe>
+      <p id="reader-mode-status" class="visually-hidden" role="status" aria-live="polite"></p>
+      <iframe id="reader-frame" title="Saved page"></iframe>
     </main>
-    <section id="reader-loading" class="reader-message"><div class="loader" aria-hidden="true"><svg viewBox="0 0 40 40"><path d="M11 9h14a4 4 0 0 1 4 4v17H15a4 4 0 0 1-4-4V9Z"/><path d="M11 14H9a4 4 0 0 0-4 4v17h14a4 4 0 0 0 4-4M20 14v10m0 0-3.5-3.5M20 24l3.5-3.5"/></svg></div><strong id="reader-loading-title">Loading pack…</strong><p id="reader-loading-text">Opening your saved page.</p></section>
-    <section id="reader-error" class="reader-message" hidden><div class="error-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v6M12 17h.01"/></svg></div><strong id="reader-error-title">This pack could not be opened.</strong><p id="reader-error-text"></p><button id="retry-reader" class="retry-button" type="button">Try again</button></section>
+
+    <section id="reader-loading" class="reader-message">
+      <div class="loader" aria-hidden="true">
+        <svg viewBox="0 0 40 40"><path d="M11 9h14a4 4 0 0 1 4 4v17H15a4 4 0 0 1-4-4V9Z"/><path d="M11 14H9a4 4 0 0 0-4 4v17h14a4 4 0 0 0 4-4M20 14v10m0 0-3.5-3.5M20 24l3.5-3.5"/></svg>
+      </div>
+      <strong id="reader-loading-title">Opening your save…</strong>
+      <p id="reader-loading-text">Reading it from this device.</p>
+    </section>
+
+    <section id="reader-error" class="reader-message" hidden>
+      <div class="error-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v6M12 17h.01"/></svg>
+      </div>
+      <strong id="reader-error-title">This save could not be opened</strong>
+      <p id="reader-error-text"></p>
+      <button id="retry-reader" class="retry-button" type="button">Try again</button>
+    </section>
+
     <script src="viewer-bootstrap.js"></script>
   </body>
 </html>

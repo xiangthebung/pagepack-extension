@@ -2,9 +2,13 @@ import { removePackPageFromPack } from "./pack-page.js";
 import { journeyQueueSummary } from "./journey-queue.js";
 
 const PAGEPACK_DB = "pagepack-db";
-const PAGEPACK_DB_VERSION = 8;
+const PAGEPACK_DB_VERSION = 9;
 const LEGACY_ROOT_FOLDER_ID = "unfiled";
+// Bounded per page so the library index stays small enough to read and search
+// quickly. Enough text to match a title, headings, and the opening paragraphs.
+const SEARCH_TEXT_LIMIT = 4000;
 export const DEFAULT_FOLDER_ID = null;
+export const FOLDER_NAME_LIMIT = 60;
 
 function normalizeFolderId(folderId) {
   return folderId === LEGACY_ROOT_FOLDER_ID || folderId === "folder_unfiled" || !folderId ? DEFAULT_FOLDER_ID : folderId;
@@ -60,7 +64,8 @@ function searchableText(html) {
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 100000);
+    .slice(0, SEARCH_TEXT_LIMIT)
+    .toLowerCase();
 }
 
 function packSummary(pack) {
@@ -214,9 +219,38 @@ export function getPack(id) {
   return runStoreRequest("packs", "readonly", (store) => store.get(id));
 }
 
-export function listPacks() {
+function readPackIndex() {
   return runStoreRequest("packIndex", "readonly", (store) => store.getAll())
     .then((packs) => (Array.isArray(packs) ? packs : []).sort((a, b) => b.savedAt - a.savedAt));
+}
+
+/**
+ * Compact library listing. Page text and the per-issue detail stay in the
+ * database so a listing never has to travel through extension messaging;
+ * `searchPackText` and `getPackIssues` read them on demand instead.
+ */
+export function listPacks() {
+  return readPackIndex().then((packs) => packs.map(({ failures, pages, ...pack }) => ({
+    ...pack,
+    pages: (pages || []).map((page) => ({ url: page.url, title: page.title })),
+  })));
+}
+
+export function getPackIssues(id) {
+  return runStoreRequest("packIndex", "readonly", (store) => store.get(id))
+    .then((summary) => (Array.isArray(summary?.failures) ? summary.failures : []));
+}
+
+/** Pack ids whose captured page text contains every whitespace-separated term. */
+export function searchPackText(query) {
+  const terms = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return Promise.resolve([]);
+  return readPackIndex().then((packs) => packs
+    .filter((pack) => (pack.pages || []).some((page) => {
+      const haystack = `${String(page.title || "").toLowerCase()} ${page.searchText || ""}`;
+      return terms.every((term) => haystack.includes(term));
+    }))
+    .map((pack) => pack.id));
 }
 
 export function deletePack(id) {
@@ -277,6 +311,19 @@ export function listFolders() {
 export function putFolder(folder) {
   return runStoreRequest("folders", "readwrite", (store) => store.put(folder));
 }
+
+export function renameFolder(id, name) {
+  const nextName = String(name || "").trim().slice(0, FOLDER_NAME_LIMIT);
+  if (!nextName) return Promise.reject(new Error("Give the folder a name."));
+  return runStoreRequest("folders", "readonly", (store) => store.get(id)).then((folder) => {
+    if (!folder) throw new Error("That folder no longer exists.");
+    if (folder.name === nextName) return folder;
+    const renamed = { ...folder, name: nextName };
+    return putFolder(renamed).then(() => renamed);
+  });
+}
+
+
 
 export function deleteFolder(id) {
   return listPacks()
@@ -405,6 +452,8 @@ function journeySummary(journey) {
     pageCount: queueState.pageCount,
     savedCount: queueState.savedCount,
     queuedCount: queueState.queuedCount,
+    pendingCount: queueState.pendingCount,
+    failedCount: queueState.failedCount,
     totalBytes: Number(journey.totalBytes) || 0,
     failed: Array.isArray(journey.failures) ? journey.failures.length : Number(journey.failed) || 0,
     message: journey.message || "",

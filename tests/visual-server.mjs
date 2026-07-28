@@ -17,7 +17,7 @@ const mockChrome = `<script>
   const folders = [{ id: 'folder_research', name: 'Research', createdAt: Date.now() - 100000, sortOrder: 0 }];
   const journeys = journeyMode ? [{
     id: 'journey_test', state: 'recording', rootUrl: 'https://example.com/start', title: 'Example journey',
-    pageCount: 3, savedCount: 1, queuedCount: 2, message: '1 saved · 2 waiting',
+    pageCount: 3, savedCount: 1, queuedCount: 2, pendingCount: 2, failedCount: 0, message: '1 saved · 2 waiting',
     pageTitles: [
       { title: 'Starting page', url: 'https://example.com/start', state: 'saved' },
       { title: 'A page being saved', url: 'https://example.com/second', state: 'queued' },
@@ -40,6 +40,9 @@ const mockChrome = `<script>
           reply(callback, { ok: true });
         }
         else if (message.type === 'REMOVE_PACK_PAGE') reply(callback, { ok: true });
+        else if (message.type === 'GET_CAPTURE_PREFERENCES') reply(callback, { preferences: { depth: 0, runScripts: true, folderId: null } });
+        else if (message.type === 'SEARCH_LIBRARY') reply(callback, { packIds: [] });
+        else if (message.type === 'GET_PACK_ISSUES') reply(callback, { issues: [] });
         else reply(callback, { ok: true, accepted: true, requestId: 'capture_test' });
       }
     },

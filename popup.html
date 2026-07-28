@@ -9,18 +9,18 @@
   <body>
     <div class="app">
       <header class="app-header">
-        <div class="brand-mark" aria-hidden="true">
+        <span class="brand-mark" aria-hidden="true">
           <svg viewBox="0 0 32 32" focusable="false">
             <path d="M9.5 7.5h11a3 3 0 0 1 3 3v13h-11a3 3 0 0 1-3-3v-13Z"/>
             <path d="M9.5 11.5h-1a3 3 0 0 0-3 3v10h11a3 3 0 0 0 3-3"/>
             <path d="M16.5 11v7m0 0-2.5-2.5m2.5 2.5 2.5-2.5"/>
           </svg>
-        </div>
-        <div class="brand-copy">
+        </span>
+        <span class="brand-copy">
           <strong>PagePack</strong>
-          <span class="header-meta"><span id="header-status">Ready</span><span id="quota-count" class="header-quota is-loading" aria-live="polite">Loading</span></span>
-        </div>
-        <button id="plan-chip" class="plan-chip" type="button">Free</button>
+          <span id="plan-summary" class="plan-summary">Checking your plan…</span>
+        </span>
+        <button id="plan-chip" class="plan-chip" type="button">Free<span class="visually-hidden"> plan — view PagePack Pro</span></button>
       </header>
 
       <nav class="tabs" role="tablist" aria-label="PagePack sections">
@@ -35,200 +35,287 @@
       </nav>
 
       <main class="view-panel">
-        <section id="save-view" class="view" role="tabpanel" aria-labelledby="save-tab">
-          <div class="section-intro">
-            <h1>Save for later</h1>
-            <p>Keep a private copy you can open without a connection.</p>
+        <section id="save-view" class="view" role="tabpanel" aria-labelledby="save-tab" tabindex="-1">
+          <div class="target-card">
+            <span id="target-mark" class="target-mark" aria-hidden="true">·</span>
+            <span class="target-copy">
+              <strong id="target-title">Reading the current tab…</strong>
+              <span id="target-host"></span>
+            </span>
           </div>
 
-          <section id="capture-card" class="capture-card">
-            <p id="save-status" class="status-message" role="status"></p>
-            <div id="capture-mode-options" class="capture-mode-options" role="radiogroup" aria-label="Capture mode">
-              <label class="capture-mode-option is-selected" data-capture-mode="page" role="radio" aria-checked="true" for="capture-mode-page">
-                <input id="capture-mode-page" name="capture-mode" type="radio" value="page" checked>
-                <span class="mode-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" focusable="false"><rect x="5" y="3.5" width="14" height="17" rx="2.5"/><path d="M8.5 8h7M8.5 11.5h7M8.5 15h4"/></svg>
-                </span>
-                <span class="mode-copy"><strong>This page</strong><small>Capture the current tab</small></span>
-                <span class="mode-check" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="m5.5 10 3 3 6-6"/></svg></span>
-              </label>
-              <label class="capture-mode-option" data-capture-mode="journey" role="radio" aria-checked="false" for="capture-mode-journey">
-                <input id="capture-mode-journey" name="capture-mode" type="radio" value="journey">
-                <span class="mode-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" focusable="false"><circle cx="6" cy="17.5" r="2"/><circle cx="12" cy="11.5" r="2"/><circle cx="18" cy="5.5" r="2"/><path d="m7.5 16 3-3m3-3 3-3"/></svg>
-                </span>
-                <span class="mode-copy"><strong>Browsing journey</strong><small>Keep collecting pages as you browse</small></span>
-                <span class="mode-check" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="m5.5 10 3 3 6-6"/></svg></span>
-              </label>
-            </div>
+          <div id="save-action" class="save-action">
+            <button id="save-button" class="primary-button" type="button">Save page</button>
+            <button id="quota-upgrade-button" class="link-button" type="button" hidden>See PagePack Pro</button>
+          </div>
 
-            <div id="journey-active" class="journey-active-panel" hidden>
-              <div class="journey-summary"><strong id="journey-count">0 pages</strong><span id="journey-status">Starting…</span></div>
-              <div id="journey-progress" class="journey-progress" role="progressbar" aria-label="Saving journey" aria-valuetext="Saving journey" hidden><span></span></div>
-              <div id="journey-pages" class="journey-pages"></div>
-              <div class="journey-discard-slot">
-                <button id="journey-discard-button" class="link-button journey-discard-button" type="button">Discard journey</button>
-                <div id="journey-discard-confirmation" class="journey-discard-confirmation" hidden>
-                  <button id="cancel-discard-journey" type="button">Cancel</button>
-                  <button id="confirm-discard-journey" type="button">Delete</button>
-                </div>
-              </div>
+          <section id="save-progress" class="progress-card" aria-labelledby="progress-title" hidden>
+            <div class="progress-head">
+              <strong id="progress-title">Saving this page</strong>
+              <span id="progress-detail" class="progress-detail"></span>
             </div>
-
-            <div class="capture-shared">
-              <div class="shared-subheading">Options</div>
-              <div class="settings-group">
-                <div class="setting-row destination-row">
-                  <span class="setting-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3.5 7.5h7l2-2h8v14h-17z"/></svg></span>
-                  <label class="setting-copy" for="save-folder"><strong>Save to</strong><small>Choose a folder</small></label>
-                  <div class="folder-picker" id="folder-picker">
-                    <input id="save-folder" type="hidden" value="">
-                    <button id="save-folder-trigger" class="folder-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="save-folder-menu" aria-labelledby="save-folder-label">
-                      <span id="save-folder-label">Library</span>
-                      <span class="select-chevron" aria-hidden="true"></span>
-                    </button>
-                    <div id="save-folder-menu" class="folder-menu" role="listbox" aria-label="Folder for captured pages" hidden></div>
-                  </div>
-                </div>
-
-                <div id="capture-settings" class="capture-settings" aria-label="Capture settings">
-                  <div class="capture-options">
-                    <label class="option-field" for="depth-value">
-                      <span class="setting-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 6.5h8a3 3 0 0 1 3 3v1M19 17.5h-8a3 3 0 0 1-3-3v-1M13 8.5l3 2 3-2M11 15.5l-3-2-3 2"/></svg></span>
-                      <span class="setting-copy"><strong>Link depth</strong><small>Follow same-site links</small></span>
-                      <span class="stepper"><button type="button" data-depth-step="-1" aria-label="Decrease recursion depth">−</button><output id="depth-value">0</output><button type="button" data-depth-step="1" aria-label="Increase recursion depth">+</button></span>
-                    </label>
-                    <label class="option-field check-field" for="run-scripts">
-                      <span class="setting-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m8.5 7.5-4 4 4 4m7-8 4 4-4 4M13.5 4l-3 15"/></svg></span>
-                      <span class="setting-copy"><strong>Include scripts <button id="scripts-info-button" class="info-button" type="button" aria-label="What are scripts and why save them?" aria-expanded="false" aria-controls="scripts-info">i</button></strong><small>Preserve interactive features</small></span>
-                      <input id="run-scripts" type="checkbox" checked>
-                      <i aria-hidden="true"></i>
-                    </label>
-                    <p id="scripts-info" class="option-info" role="tooltip" hidden>Scripts power dynamic content and interactions. Most pages work without them; scripts may be unreliable offline.</p>
-                  </div>
-                  <div id="pro-pack-limits" class="pro-pack-limits is-locked" aria-describedby="pro-pack-limits-note">
-                    <div class="pro-pack-limits-heading"><span>Pack limits</span><strong>PRO</strong></div>
-                    <div id="pro-pack-limit-fields" class="pro-pack-limit-fields" aria-disabled="true">
-                      <label class="pro-pack-limit-row" for="max-pages-per-pack">
-                        <span class="setting-copy"><strong>Pages per pack</strong><small>Maximum pages in one saved pack</small></span>
-                        <select id="max-pages-per-pack" disabled>
-                          <option value="250">250 pages</option>
-                          <option value="500">500 pages</option>
-                          <option value="1000">1,000 pages</option>
-                        </select>
-                      </label>
-                      <label class="pro-pack-limit-row" for="max-bytes-per-pack">
-                        <span class="setting-copy"><strong>Storage per pack</strong><small>Maximum captured assets in one pack</small></span>
-                        <select id="max-bytes-per-pack" disabled>
-                          <option value="1073741824">1 GiB</option>
-                          <option value="2147483648">2 GiB</option>
-                          <option value="4294967296">4 GiB</option>
-                        </select>
-                      </label>
-                    </div>
-                    <p id="pro-pack-limits-note" class="pro-pack-limits-note">Upgrade to Pro to increase pack limits.</p>
-                  </div>
-                </div>
-              </div>
+            <div id="progress-bar" class="progress-bar" role="progressbar" aria-labelledby="progress-title" aria-valuemin="0" aria-valuemax="100">
+              <span id="progress-fill"></span>
             </div>
-
-            <div class="capture-footer">
-              <button id="capture-start-button" class="primary-button" type="button">Start</button>
-              <button id="journey-finish-button" class="primary-button" type="button" hidden>Done</button>
-              <button id="cancel-save-button" class="cancel-save-button" type="button" hidden>Cancel save</button>
-            </div>
-            <p class="local-note"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 7V5.5a3.5 3.5 0 0 1 7 0V7M3 7h10v7H3z"/></svg> Saved pages stay on this device.</p>
-            <p id="save-background-note" class="background-save-note" hidden>You can close this popup or switch tabs; saving continues.</p>
+            <p class="progress-hint">You can close this window — saving continues in the background.</p>
+            <button id="cancel-save-button" class="quiet-danger-button" type="button">Cancel save</button>
           </section>
+
+          <section id="collect-panel" class="collect-panel" aria-labelledby="collect-title" hidden>
+            <div class="collect-head">
+              <strong id="collect-title">Collecting as you browse</strong>
+              <span id="collect-count" class="collect-count">0 pages</span>
+            </div>
+            <p id="collect-status" class="collect-status">Browse normally. Every page you open here is added.</p>
+            <div id="collect-pages" class="collect-pages"></div>
+            <div class="collect-actions">
+              <button id="collect-finish-button" class="primary-button" type="button">Save these pages</button>
+              <button id="collect-discard-button" class="quiet-danger-button" type="button">Discard</button>
+            </div>
+          </section>
+
+          <p id="save-status" class="status-message" role="status" aria-live="polite"></p>
+
+          <button id="collect-start-button" class="option-row" type="button">
+            <span class="option-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false"><circle cx="6" cy="17.5" r="2"/><circle cx="12" cy="11.5" r="2"/><circle cx="18" cy="5.5" r="2"/><path d="m7.5 16 3-3m3-3 3-3"/></svg>
+            </span>
+            <span class="option-copy">
+              <strong>Save as I browse</strong>
+              <small>Collect the pages you visit into one save</small>
+            </span>
+            <span class="option-chevron" aria-hidden="true"></span>
+          </button>
+
+          <div class="destination-row">
+            <span class="option-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false"><path d="M3.5 7.5h7l2-2h8v14h-17z"/></svg>
+            </span>
+            <span class="option-copy">
+              <strong>Save to</strong>
+              <small>Where new saves are filed</small>
+            </span>
+            <span class="folder-picker" id="folder-picker">
+              <input id="save-folder" type="hidden" value="">
+              <button id="save-folder-trigger" class="folder-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="save-folder-menu" aria-label="Save to folder: Library">
+                <span id="save-folder-label">Library</span>
+                <span class="select-chevron" aria-hidden="true"></span>
+              </button>
+              <div id="save-folder-menu" class="popover-menu folder-menu" role="listbox" aria-label="Choose a folder" hidden></div>
+            </span>
+          </div>
+
+          <details class="disclosure">
+            <summary>
+              <span class="disclosure-label">Options</span>
+              <span id="options-summary" class="disclosure-value">Single page</span>
+              <span class="disclosure-chevron" aria-hidden="true"></span>
+            </summary>
+            <div class="disclosure-body">
+              <div class="setting-row">
+                <label class="option-copy" for="depth-select">
+                  <strong>Linked pages</strong>
+                  <small>Also save pages linked from this one, on the same site</small>
+                </label>
+                <select id="depth-select">
+                  <option value="0">Just this page</option>
+                  <option value="1">One level of links</option>
+                  <option value="2">Two levels</option>
+                  <option value="3">Three levels</option>
+                </select>
+              </div>
+
+              <div class="setting-row">
+                <label class="option-copy" for="run-scripts">
+                  <strong>Keep scripts</strong>
+                  <small>Preserves interactive parts. Makes saves larger.</small>
+                </label>
+                <span class="switch">
+                  <input id="run-scripts" type="checkbox" checked>
+                  <span class="switch-track" aria-hidden="true"></span>
+                </span>
+              </div>
+
+              <div id="pack-limits-pro" class="pro-hint" hidden>
+                <p>Pro raises the per-save ceiling to 1,000 pages and 4&nbsp;GiB.</p>
+                <button id="pack-limits-upgrade-button" class="link-button" type="button">See PagePack Pro</button>
+              </div>
+
+              <div id="pack-limits-fields" class="pack-limits" hidden>
+                <div class="setting-row">
+                  <label class="option-copy" for="max-pages-per-pack">
+                    <strong>Pages per save</strong>
+                    <small>Safety ceiling for one saved item</small>
+                  </label>
+                  <select id="max-pages-per-pack">
+                    <option value="250">250 pages</option>
+                    <option value="500">500 pages</option>
+                    <option value="1000">1,000 pages</option>
+                  </select>
+                </div>
+                <div class="setting-row">
+                  <label class="option-copy" for="max-bytes-per-pack">
+                    <strong>Storage per save</strong>
+                    <small>Higher ceilings use more space on this device</small>
+                  </label>
+                  <select id="max-bytes-per-pack">
+                    <option value="1073741824">1 GiB</option>
+                    <option value="2147483648">2 GiB</option>
+                    <option value="4294967296">4 GiB</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <p class="local-note">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 7V5.5a3.5 3.5 0 0 1 7 0V7M3 7h10v7H3z"/></svg>
+            Everything you save stays on this device.
+          </p>
         </section>
 
-        <section id="library-view" class="view" role="tabpanel" aria-labelledby="library-tab" hidden>
-          <div class="library-heading">
-            <div class="heading-line">
-              <div>
-                <h1 id="library-title">Saved pages</h1>
-                <p>Private, organized, and available offline.</p>
-              </div>
-              <button id="new-folder-button" class="text-button" type="button" aria-label="New folder" title="New folder"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h7l2-2h8v14h-17zM12 11v5m-2.5-2.5h5"/></svg></button>
+        <section id="library-view" class="view" role="tabpanel" aria-labelledby="library-tab" tabindex="-1" hidden>
+          <div class="library-head">
+            <button id="folder-back-button" class="back-button" type="button" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 6l-6 6 6 6"/></svg>
+              <span>Library</span>
+            </button>
+            <div class="library-title-row">
+              <h1 id="library-title">Library</h1>
+              <button id="new-folder-button" class="icon-button" type="button" aria-label="New folder" title="New folder">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h7l2-2h8v14h-17zM12 11v5m-2.5-2.5h5"/></svg>
+              </button>
             </div>
+            <p id="library-subtitle" class="library-subtitle">Private, on this device, ready offline.</p>
           </div>
 
           <form id="new-folder-form" class="new-folder-form" hidden>
-            <input id="new-folder-name" type="text" maxlength="80" placeholder="Folder name" autocomplete="off">
+            <label class="visually-hidden" for="new-folder-name">Folder name</label>
+            <input id="new-folder-name" type="text" maxlength="60" placeholder="Folder name" autocomplete="off">
             <button class="small-primary" type="submit">Create</button>
             <button id="cancel-folder-button" class="small-quiet" type="button">Cancel</button>
           </form>
 
-          <label class="search-box"><span aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 4.5 4.5"/></svg></span><input id="library-search" type="search" placeholder="Search saved pages" autocomplete="off"><button id="clear-search" type="button" aria-label="Clear search" hidden><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="8"/><path d="m7.5 7.5 5 5m0-5-5 5"/></svg></button></label>
-          <div id="library-list" class="library-list"></div>
-          <p id="reorder-status" class="visually-hidden" role="status" aria-live="polite"></p>
-          <div id="library-empty" class="empty-state" hidden><div class="empty-sparkle" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M9 13h13l4-4h13v29H9z"/><path d="M18 24h12m-6-6v12"/></svg></div><strong id="empty-title">No saved pages yet.</strong><p id="empty-help">Saved pages will stay on this device.</p></div>
-        </section>
+          <div class="search-box">
+            <span aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 4.5 4.5"/></svg></span>
+            <label class="visually-hidden" for="library-search">Search saved pages</label>
+            <input id="library-search" type="search" placeholder="Search titles, sites, and text" autocomplete="off">
+            <button id="clear-search" type="button" aria-label="Clear search" hidden>
+              <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="8"/><path d="m7.5 7.5 5 5m0-5-5 5"/></svg>
+            </button>
+          </div>
 
+          <p id="library-count" class="library-count" role="status" aria-live="polite"></p>
+          <div id="library-list" class="library-list" role="list"></div>
+          <p id="reorder-status" class="visually-hidden" role="status" aria-live="polite"></p>
+          <div id="library-empty" class="empty-state" hidden>
+            <span class="empty-mark" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M9 13h13l4-4h13v29H9z"/><path d="M18 24h12m-6-6v12"/></svg></span>
+            <strong id="empty-title">Nothing saved yet</strong>
+            <p id="empty-help">Open a page you want to keep, then choose Save.</p>
+          </div>
+        </section>
       </main>
 
-      <div id="pro-overlay" class="pro-overlay" role="dialog" aria-modal="true" aria-labelledby="pro-title" hidden>
-        <div class="pro-scrim" data-close-pro="true"></div>
-        <section id="pro-view" class="pro-modal">
-          <div class="pro-modal-heading">
-            <div class="section-intro">
-              <div class="section-kicker">PAGEPACK PRO</div>
+      <div id="row-menu" class="popover-menu row-menu" role="menu" hidden></div>
+
+      <div id="pro-overlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="pro-title" hidden>
+        <div class="scrim" data-close-overlay="pro"></div>
+        <section class="sheet">
+          <div class="sheet-head">
+            <div>
+              <p class="sheet-kicker">PAGEPACK PRO</p>
               <h1 id="pro-title">Unlimited monthly saves</h1>
             </div>
-            <button id="close-pro-button" class="icon-button close-pro-button" type="button" aria-label="Close Pro details"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg></button>
+            <button id="close-pro-button" class="icon-button" type="button" aria-label="Close">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg>
+            </button>
           </div>
 
           <div class="pro-card">
-            <div id="pro-price" class="pro-price"><strong>CAD $1.99</strong><span>/ month</span></div>
+            <p id="pro-price" class="pro-price"><strong>CAD $1.99</strong><span>/ month</span></p>
             <p id="pro-price-alt" class="pro-price-alt">or CAD $9.99/year — over half off</p>
             <ul class="pro-benefits">
-              <li>Unlimited page saves each month</li>
-              <li>Choose up to 1,000 pages per pack</li>
-              <li>Choose up to 4 GiB of storage per pack</li>
+              <li>Unlimited page saves every month</li>
+              <li>Up to 1,000 pages in one save</li>
+              <li>Up to 4 GiB of files in one save</li>
             </ul>
-            <button id="upgrade-button" class="primary-button pro-primary" type="button">Upgrade to Pro</button>
+            <button id="upgrade-button" class="primary-button" type="button">Upgrade to Pro</button>
             <button id="manage-button" class="secondary-button" type="button" hidden>Manage subscription</button>
             <button id="restore-button" class="link-button" type="button">Already subscribed? Sign in</button>
             <button id="refresh-plan-button" class="link-button" type="button">Refresh plan status</button>
           </div>
-          <p id="pro-status" class="status-message" role="status"></p>
-          <p class="seller-note">PagePack Pro is sold by the PagePack developer through ExtensionPay. ExtensionPay sends checkout funds to the Stripe account connected to the PagePack merchant account; Google does not receive or process these payments.</p>
+          <p id="pro-status" class="status-message" role="status" aria-live="polite"></p>
+          <p class="fine-print">PagePack Pro is sold by the PagePack developer through ExtensionPay, which routes payments to the connected Stripe account. Google does not process these payments.</p>
         </section>
       </div>
 
-      <div id="issues-overlay" class="issues-overlay" role="dialog" aria-modal="true" aria-labelledby="issues-title" hidden>
-        <div class="pro-scrim" data-close-issues="true"></div>
-        <section class="issues-modal">
-          <div class="pro-modal-heading">
-            <div class="section-intro">
-              <div class="section-kicker">CAPTURE REPORT</div>
-              <h1 id="issues-title">Saved with issues</h1>
+      <div id="issues-overlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="issues-title" hidden>
+        <div class="scrim" data-close-overlay="issues"></div>
+        <section class="sheet">
+          <div class="sheet-head">
+            <div>
+              <p class="sheet-kicker">SAVE REPORT</p>
+              <h1 id="issues-title">Some parts are missing</h1>
             </div>
-            <div class="issues-header-actions">
-              <button id="ignore-all-issues-button" class="issue-ignore-all-button" type="button">Ignore all</button>
-              <button id="close-issues-button" class="icon-button close-pro-button" type="button" aria-label="Close capture report"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg></button>
-            </div>
+            <button id="close-issues-button" class="icon-button" type="button" aria-label="Close">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg>
+            </button>
           </div>
-          <p id="issues-summary" class="issues-summary"></p>
+          <p id="issues-summary" class="sheet-summary"></p>
           <div id="issues-list" class="issues-list"></div>
+          <div class="sheet-actions">
+            <button id="retry-all-issues-button" class="secondary-button" type="button">Retry all</button>
+            <button id="ignore-all-issues-button" class="link-button" type="button">Dismiss all</button>
+          </div>
         </section>
       </div>
 
-      <div id="journey-review-overlay" class="issues-overlay" role="dialog" aria-modal="true" aria-labelledby="journey-review-title" hidden>
-        <div class="pro-scrim" data-close-journey-review="true"></div>
-        <section class="issues-modal journey-review-modal">
-          <div class="pro-modal-heading">
-            <div class="section-intro">
-              <div class="section-kicker">SAVE JOURNEY</div>
-              <h1 id="journey-review-title">Review your pages</h1>
+      <div id="review-overlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="review-title" hidden>
+        <div class="scrim" data-close-overlay="review"></div>
+        <section class="sheet">
+          <div class="sheet-head">
+            <div>
+              <p class="sheet-kicker">BEFORE SAVING</p>
+              <h1 id="review-title">Choose what to keep</h1>
             </div>
-            <button id="close-journey-review-button" class="icon-button close-pro-button" type="button" aria-label="Keep browsing"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg></button>
+            <button id="close-review-button" class="icon-button" type="button" aria-label="Keep browsing">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg>
+            </button>
           </div>
-          <p id="journey-review-summary" class="issues-summary"></p>
-          <div id="journey-review-list" class="journey-review-list"></div>
-          <div class="issues-actions journey-review-actions">
-            <button id="save-reviewed-journey-button" class="primary-button" type="button">Save journey</button>
+          <p id="review-summary" class="sheet-summary"></p>
+          <div id="review-list" class="review-list"></div>
+          <div class="sheet-actions">
+            <button id="save-reviewed-button" class="primary-button" type="button">Save selected pages</button>
             <button id="keep-browsing-button" class="link-button" type="button">Keep browsing</button>
+          </div>
+        </section>
+      </div>
+
+      <div id="move-overlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="move-title" hidden>
+        <div class="scrim" data-close-overlay="move"></div>
+        <section class="sheet sheet-compact">
+          <div class="sheet-head">
+            <div>
+              <p class="sheet-kicker">MOVE</p>
+              <h1 id="move-title">Move to folder</h1>
+            </div>
+            <button id="close-move-button" class="icon-button" type="button" aria-label="Close">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg>
+            </button>
+          </div>
+          <p id="move-summary" class="sheet-summary"></p>
+          <div id="move-list" class="move-list" role="listbox" aria-labelledby="move-title"></div>
+        </section>
+      </div>
+
+      <div id="confirm-overlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-body" hidden>
+        <div class="scrim" data-close-overlay="confirm"></div>
+        <section class="sheet sheet-compact">
+          <h1 id="confirm-title">Delete this?</h1>
+          <p id="confirm-body" class="sheet-summary"></p>
+          <div class="sheet-actions confirm-actions">
+            <button id="confirm-cancel-button" class="secondary-button" type="button">Cancel</button>
+            <button id="confirm-accept-button" class="danger-button" type="button">Delete</button>
           </div>
         </section>
       </div>

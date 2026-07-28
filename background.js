@@ -5,7 +5,9 @@ import {
   deleteJourney,
   deletePack,
   findSavedUrl,
+  FOLDER_NAME_LIMIT,
   getPack,
+  getPackIssues,
   getCapture,
   getJourney,
   getSetting,
@@ -22,6 +24,8 @@ import {
   putJourney,
   putFolder,
   putPack,
+  renameFolder,
+  searchPackText,
   setSetting,
   reorderFolders,
 } from "./storage.js";
@@ -48,6 +52,9 @@ import {
 } from "./journey-queue.js";
 
 const MAX_RESOURCE_BYTES = 128 * 1024 * 1024;
+// Same-site link following. Beyond three levels the per-pack page cap is always
+// reached first, so a deeper setting only promises something it cannot keep.
+const MAX_CAPTURE_DEPTH = 3;
 const MAX_LINKS_PER_PAGE = 100;
 const RESOURCE_CONCURRENCY = 4;
 const CAPTURE_PREFERENCES_KEY = "capture-preferences";
@@ -71,11 +78,15 @@ const WORKER_ID = `worker_${Date.now()}_${Math.random().toString(36).slice(2, 8)
 const ACTIVE_CAPTURE_STATES = new Set(["queued", "reading", "saving", "finishing"]);
 const ACTIVE_JOURNEY_STATES = new Set(["recording", "finishing"]);
 
+function clampDepth(value) {
+  const depth = Math.floor(Number(value));
+  return Number.isFinite(depth) ? Math.max(0, Math.min(MAX_CAPTURE_DEPTH, depth)) : 0;
+}
+
 function normalizeCapturePreferences(value = {}) {
-  const depth = Number(value.depth);
   const packLimits = normalizePackLimits(value);
   return {
-    depth: Number.isFinite(depth) ? Math.max(0, Math.min(5, Math.floor(depth))) : DEFAULT_CAPTURE_PREFERENCES.depth,
+    depth: clampDepth(value.depth),
     runScripts: value.runScripts !== false,
     captureMode: value.captureMode === "journey" ? "journey" : "page",
     folderId: typeof value.folderId === "string" && value.folderId ? value.folderId : null,
@@ -144,7 +155,7 @@ async function recoverStaleCaptures() {
     .map((capture) => putCapture({
       ...capture,
       state: "interrupted",
-      message: "The save was interrupted before the page finished. This can happen if the tab was closed or reloaded, Chrome restarted, or the extension lost its connection. Nothing was added to the library; reopen the page and try Save again.",
+      message: "That save stopped early, so nothing was added. Open the page again and try once more.",
       error: "The capture worker stopped before it finished.",
       updatedAt: Date.now(),
       workerId: WORKER_ID,
@@ -162,7 +173,7 @@ listJourneySummaries().then(async (journeys) => {
   if (journey?.state === "finishing" && journey.workerId !== WORKER_ID) {
     journey = await updateJourney(journey.id, {
       state: "recording",
-      message: "Journey restored. Any pages still waiting will continue saving.",
+      message: "Collection restored. Pages still waiting will keep saving.",
     });
   }
   updateJourneyBadge(journeyQueueSummary(journey || active).pageCount, true);
@@ -448,8 +459,10 @@ async function ignoreAllPackIssues(packId) {
 async function hydrateResources(page, resourceCache, options, onProgress) {
   const resources = page.resources || [];
   let nextIndex = 0;
+  let completed = 0;
   let totalBytes = 0;
   const failures = [];
+  onProgress?.(0, resources.length);
   async function worker() {
     while (nextIndex < resources.length) {
       throwIfCaptureCancelled(options.requestId);
@@ -470,7 +483,8 @@ async function hydrateResources(page, resourceCache, options, onProgress) {
         // unavailable during this save.
         page.resourceMap[resource.token] = resource.url;
       }
-      onProgress?.();
+      completed += 1;
+      onProgress?.(completed, resources.length);
     }
   }
   await Promise.all(Array.from({ length: Math.min(RESOURCE_CONCURRENCY, resources.length) }, worker));
@@ -566,14 +580,41 @@ async function captureLivePage(tabId, requestId, { runScripts, captureMedia }) {
   };
 }
 
-function updateJourneyBadge(count = 0, active = true) {
+let journeyBadge = { count: 0, active: false };
+let captureBadgeActive = false;
+
+// A badge is the only signal left once the popup closes, so it reports whether
+// PagePack is still collecting pages or finishing a save in the background.
+function paintActionBadge() {
   try {
-    chrome.action.setBadgeBackgroundColor({ color: active ? "#b85c5c" : "#4c8061" });
-    chrome.action.setBadgeText({ text: active ? (count > 99 ? "99+" : String(count)) : "" });
-    chrome.action.setTitle({ title: active ? `PagePack is collecting ${count} ${count === 1 ? "page" : "pages"}` : "Save this page offline" });
+    if (journeyBadge.active) {
+      const count = journeyBadge.count;
+      chrome.action.setBadgeBackgroundColor({ color: "#b85c5c" });
+      chrome.action.setBadgeText({ text: count > 99 ? "99+" : String(count) });
+      chrome.action.setTitle({ title: `PagePack is collecting ${count} ${count === 1 ? "page" : "pages"}` });
+      return;
+    }
+    if (captureBadgeActive) {
+      chrome.action.setBadgeBackgroundColor({ color: "#0a84ff" });
+      chrome.action.setBadgeText({ text: "•" });
+      chrome.action.setTitle({ title: "PagePack is saving this page" });
+      return;
+    }
+    chrome.action.setBadgeText({ text: "" });
+    chrome.action.setTitle({ title: "Save this page offline" });
   } catch {
     // Badge updates are only a visual enhancement.
   }
+}
+
+function updateJourneyBadge(count = 0, active = true) {
+  journeyBadge = { count: Number(count) || 0, active: Boolean(active) };
+  paintActionBadge();
+}
+
+function setCaptureBadge(active) {
+  captureBadgeActive = Boolean(active);
+  paintActionBadge();
 }
 
 async function getActiveJourney() {
@@ -692,9 +733,9 @@ async function processJourneyQueueItem(journeyId, item) {
       next.failures = [...(latest.failures || []), {
         type: "page-limit",
         url,
-        message: `This journey reached PagePack’s ${packLimits.maxPages}-page safety limit.`,
+        message: `This collection reached PagePack’s ${packLimits.maxPages}-page safety limit.`,
       }];
-      next.message = "The journey reached its page limit. Finish it to save the pages collected so far.";
+      next.message = "This collection reached its page limit. Save it now to keep what you have.";
       return next;
     });
     return;
@@ -728,7 +769,7 @@ async function processJourneyQueueItem(journeyId, item) {
         ? { ...queuedItem, state: "failed" }
         : queuedItem) };
       next.failures = [...(latest.failures || []), { type: "page", url, message }];
-      next.message = `Could not save ${item.title || url}. Keep browsing or finish the journey.`;
+      next.message = `Couldn’t save ${item.title || url}. Keep browsing, or save what you have.`;
       return next;
     });
     sendPopupMessage({ type: "JOURNEY_ERROR", journeyId, message });
@@ -748,9 +789,9 @@ async function processJourneyQueueItem(journeyId, item) {
       next.failures = [...(latest.failures || []), {
         type: "pack-limit",
         url: result.page.url,
-        message: `This journey reached PagePack’s ${formatPackSize(packLimits.maxTotalBytes)} pack limit.`,
+        message: `This collection reached PagePack’s ${formatPackSize(packLimits.maxTotalBytes)} size limit.`,
       }];
-      next.message = "The journey reached its pack limit. Finish it to save the pages collected so far.";
+      next.message = "This collection reached its size limit. Save it now to keep what you have.";
       return next;
     }
     let next = removeJourneyItem(latest, item.id);
@@ -853,7 +894,7 @@ async function waitForJourneyQueue(journeyId) {
       await wait(50);
     }
   }
-  throw new Error("Some journey pages are still waiting to be saved.");
+  throw new Error("Some collected pages are still being saved. Try again in a moment.");
 }
 
 async function trackJourneyTab(journeyId, tabId, parentTabId = null) {
@@ -870,19 +911,19 @@ async function trackJourneyTab(journeyId, tabId, parentTabId = null) {
 
 async function startJourney(message) {
   if (!Number.isInteger(message.tabId) || !isHttpUrl(message.pageUrl)) {
-    throw new Error("The current page cannot start a journey.");
+    throw new Error("This page cannot start a collection.");
   }
-  if (captureStarting) throw new Error("Another save is starting. Wait for it to finish first.");
+  if (captureStarting) throw new Error("Another save is already starting. Wait for it to finish.");
   const current = await getActiveJourney();
-  if (current) throw new Error("A journey is already being collected. Finish or discard it first.");
+  if (current) throw new Error("You’re already collecting pages. Save or discard that collection first.");
   const captures = await listCaptures();
   if (captures.some((capture) => ACTIVE_CAPTURE_STATES.has(capture.state))) {
-    throw new Error("Another page is already being saved. Wait for it to finish first.");
+    throw new Error("Another page is already being saved. Wait for it to finish.");
   }
   const monetization = await getMonetizationState({ refresh: true });
   const isPaid = monetization.entitlement.paid;
   if (!isPaid && monetization.remaining < 1) {
-    throw new Error(`You’ve used all ${PRICING.freePagesPerMonth} free pages for this month. Upgrade to Pro to keep saving.`);
+    throw new Error(`You’ve used all ${PRICING.freePagesPerMonth} free saves this month. Upgrade to Pro to keep saving.`);
   }
   const packLimits = effectivePackLimits(message, isPaid);
   const journey = {
@@ -904,7 +945,7 @@ async function startJourney(message) {
     ...packLimits,
     startedAt: Date.now(),
     updatedAt: Date.now(),
-    message: "Starting journey…",
+    message: "Collecting…",
     countAgainstQuota: !isPaid,
   };
   await putJourney(journey);
@@ -915,13 +956,13 @@ async function startJourney(message) {
 
 async function finishJourney(journeyId, excludedUrls = []) {
   const journey = await getJourney(journeyId);
-  if (!journey || !ACTIVE_JOURNEY_STATES.has(journey.state)) throw new Error("This journey is no longer active.");
-  if (journeyFinishingIds.has(journeyId)) throw new Error("This journey is already being saved.");
+  if (!journey || !ACTIVE_JOURNEY_STATES.has(journey.state)) throw new Error("That collection is no longer active.");
+  if (journeyFinishingIds.has(journeyId)) throw new Error("That collection is already being saved.");
   journeyFinishingIds.add(journeyId);
-  await updateJourney(journeyId, { state: "finishing", message: "Finishing your journey…" });
+  await updateJourney(journeyId, { state: "finishing", message: "Saving your collection…" });
   await waitForJourneyQueue(journeyId);
   const latest = await getJourney(journeyId);
-  if (!latest) throw new Error("The journey draft could not be found.");
+  if (!latest) throw new Error("That collection could not be found.");
   if (!latest.pages?.length) {
     await deleteJourney(journeyId);
     journeyFinishingIds.delete(journeyId);
@@ -932,7 +973,7 @@ async function finishJourney(journeyId, excludedUrls = []) {
   // The journey's starting page is always part of the saved journey, even if
   // an older client sends it in the exclusion list.
   const pages = latest.pages.filter((page, index) => index === 0 || !excluded.has(normalizeUrl(page.url)));
-  if (!pages.length) throw new Error("Keep at least one page in the journey.");
+  if (!pages.length) throw new Error("Keep at least one page in the collection.");
   const pageUrls = new Set(pages.map((page) => normalizeUrl(page.url)));
   const visits = (latest.visits || []).filter((visit) => pageUrls.has(normalizeUrl(visit.pageUrl)));
   const packLimits = normalizePackLimits(latest);
@@ -977,11 +1018,26 @@ async function finishJourney(journeyId, excludedUrls = []) {
 
 async function discardJourney(journeyId) {
   const journey = await getJourney(journeyId);
-  if (!journey) throw new Error("This journey is no longer active.");
+  if (!journey) throw new Error("That collection is no longer active.");
   await deleteJourney(journeyId);
   journeyFinishingIds.delete(journeyId);
   updateJourneyBadge(0, false);
   sendPopupMessage({ type: "JOURNEY_DISCARDED", journeyId });
+}
+
+const CAPTURE_PHASE_STATES = Object.freeze({
+  queued: "queued",
+  reading: "reading",
+  assets: "saving",
+  finishing: "finishing",
+});
+
+function captureProgressMessage({ phase, pagesDone, pagesTotal, assetsDone, assetsTotal }) {
+  if (phase === "reading") return "Reading this page…";
+  if (phase === "finishing") return "Finishing up…";
+  const files = assetsTotal ? `${assetsDone} of ${assetsTotal} files` : "collecting files";
+  if (pagesTotal > 1) return `Page ${Math.min(pagesDone + 1, pagesTotal)} of ${pagesTotal} · ${files}`;
+  return `Saving ${files}`;
 }
 
 function cancelCaptureStream(requestId) {
@@ -1004,10 +1060,29 @@ async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, fol
     committed: false,
   };
   captureJobs.set(requestId, job);
+  setCaptureBadge(true);
+  const progress = {
+    phase: "reading",
+    pagesDone: 0,
+    pagesTotal: 1,
+    assetsDone: 0,
+    assetsTotal: 0,
+    // Link-following discovers pages as it goes, so only a single-page save can
+    // promise an honest percentage.
+    determinate: Number(depth) === 0,
+  };
+  let lastProgressAt = 0;
+  const publishProgress = async (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastProgressAt < 250) return;
+    lastProgressAt = now;
+    const payload = { ...progress, message: captureProgressMessage(progress) };
+    sendPopupMessage({ type: "CAPTURE_PROGRESS", requestId, ...payload });
+    await updateCapture(requestId, { state: CAPTURE_PHASE_STATES[progress.phase] || "saving", ...payload }).catch(() => {});
+  };
   try {
     throwIfCaptureCancelled(requestId);
-    await updateCapture(requestId, { state: "reading", phase: "reading", message: "Reading the page…" });
-  sendPopupMessage({ type: "CAPTURE_PROGRESS", requestId, phase: "reading", message: "Reading the current page…" });
+    await publishProgress(true);
   const options = { runScripts, captureMedia, requestId, signal: job.abortController.signal };
   let root;
   try {
@@ -1051,17 +1126,19 @@ async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, fol
     if (current.level > depth) continue;
     const page = pages.find((item) => item.url === current.url);
     if (!page) continue;
-    await updateCapture(requestId, {
-      state: "saving",
-      phase: "assets",
-      message: `Saving page ${processedPages + 1} of ${pages.length}…`,
-      pages: processedPages,
-      depth,
+    progress.phase = "assets";
+    progress.pagesTotal = pages.length;
+    const assetsBefore = progress.assetsDone;
+    const assetTotalBefore = progress.assetsTotal;
+    await publishProgress(true);
+    const resourceResult = await hydrateResources(page, resourceCache, options, (done, total) => {
+      progress.assetsDone = assetsBefore + done;
+      progress.assetsTotal = assetTotalBefore + total;
+      publishProgress();
     });
-    sendPopupMessage({ type: "CAPTURE_PROGRESS", requestId, phase: "assets", message: `Saving page ${processedPages + 1} of ${pages.length}…`, pages: processedPages });
-    const resourceResult = await hydrateResources(page, resourceCache, options, () => {});
     throwIfCaptureCancelled(requestId);
     processedPages += 1;
+    progress.pagesDone = processedPages;
     totalBytes += resourceResult.bytes;
     failures.push(...resourceResult.failures.map((failure) => ({ ...failure, type: "resource", pageUrl: page.url })));
     if (totalBytes > packLimits.maxTotalBytes) {
@@ -1111,18 +1188,25 @@ async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, fol
     stats: { pages: pages.length, bytes: totalBytes, resources: resourceCache.size, failed: failures.length },
   };
   throwIfCaptureCancelled(requestId);
-  await updateCapture(requestId, { state: "finishing", phase: "finishing", message: "Finishing your saved page…", pages: pages.length });
-  sendPopupMessage({ type: "CAPTURE_PROGRESS", requestId, phase: "finishing", message: "Finishing your saved page…", pages: pages.length });
+  progress.phase = "finishing";
+  progress.pagesTotal = pages.length;
+  await publishProgress(true);
   await putPack(pack);
   job.committed = true;
   if (countAgainstQuota) await consumeFreePages(pages.length).catch(() => {});
   await deleteCapture(requestId).catch(() => {});
-  const summary = (await listPacks().catch(() => [])).find((item) => item.id === pack.id);
   // Keep completion messages small. The popup reloads the compact library
   // index instead of receiving the captured HTML through the message bus.
-  sendPopupMessage({ type: "CAPTURE_COMPLETE", requestId, packId: (summary || pack).id });
+  sendPopupMessage({
+    type: "CAPTURE_COMPLETE",
+    requestId,
+    packId: pack.id,
+    pages: pack.stats.pages,
+    failed: pack.stats.failed,
+  });
   } finally {
     captureJobs.delete(requestId);
+    setCaptureBadge(false);
   }
 }
 
@@ -1159,16 +1243,16 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 async function prepareCapture(message) {
-  if (captureStarting) throw new Error("Another page is already being saved. Wait for it to finish first.");
+  if (captureStarting) throw new Error("Another page is already being saved. Wait for it to finish.");
   captureStarting = true;
   try {
     await recoveryReady;
     const captures = await listCaptures();
     if (captures.some((capture) => ACTIVE_CAPTURE_STATES.has(capture.state))) {
-      throw new Error("Another page is already being saved. Wait for it to finish first.");
+      throw new Error("Another page is already being saved. Wait for it to finish.");
     }
     if (await getActiveJourney()) {
-      throw new Error("A journey is being collected. Finish or discard it before saving a separate page.");
+      throw new Error("You’re collecting pages right now. Save or discard that collection first.");
     }
     await Promise.all(captures
       .filter((capture) => capture.state === "failed" || capture.state === "interrupted")
@@ -1177,7 +1261,7 @@ async function prepareCapture(message) {
     const monetization = await getMonetizationState({ refresh: true });
     const isPaid = monetization.entitlement.paid;
     if (!isPaid && monetization.remaining < 1) {
-      throw new Error(`You’ve used all ${PRICING.freePagesPerMonth} free pages for this month. Upgrade to Pro to keep saving.`);
+      throw new Error(`You’ve used all ${PRICING.freePagesPerMonth} free saves this month. Upgrade to Pro to keep saving.`);
     }
     const packLimits = effectivePackLimits(message, isPaid);
 
@@ -1191,7 +1275,7 @@ async function prepareCapture(message) {
       tabId: message.tabId,
       pageUrl: message.pageUrl || "",
       pageTitle: message.pageTitle || "",
-      depth: Number(message.depth) || 0,
+      depth: clampDepth(message.depth),
       ...packLimits,
       startedAt: Date.now(),
       updatedAt: Date.now(),
@@ -1200,6 +1284,7 @@ async function prepareCapture(message) {
     await putCapture(capture);
     return {
       requestId,
+      depth: clampDepth(message.depth),
       ...packLimits,
       countAgainstQuota: !isPaid,
       captureMedia: true,
@@ -1258,7 +1343,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .then((result) => sendResponse({ ok: true, empty: Boolean(result.empty), packId: result.pack?.id || null }))
       .catch(async (error) => {
         journeyFinishingIds.delete(journeyId);
-        await updateJourney(journeyId, { state: "recording", message: `${captureErrorMessage(error)} Keep browsing and try Done again.` }).catch(() => {});
+        await updateJourney(journeyId, { state: "recording", message: `${captureErrorMessage(error)} Keep browsing and try again.` }).catch(() => {});
         sendResponse({ error: captureErrorMessage(error) });
       });
     return true;
@@ -1309,14 +1394,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === "LIST_LIBRARY") {
     Promise.all([recoveryReady, listPacks(), listFolders(), listCaptures(), listJourneySummaries()])
-      .then(async ([, packs, folders, captures, journeys]) => {
-        const enrichedPacks = await Promise.all((packs || []).map(async (summary) => {
-          if (!Number(summary?.stats?.failed) || Array.isArray(summary.failures)) return summary;
-          const full = await getPack(summary.id).catch(() => null);
-          return full ? { ...summary, failures: Array.isArray(full.failures) ? full.failures.slice(0, 500) : [] } : summary;
-        }));
-        sendResponse({ packs: enrichedPacks, folders, captures, journeys });
-      })
+      .then(([, packs, folders, captures, journeys]) => sendResponse({ packs, folders, captures, journeys }))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+  if (message?.type === "SEARCH_LIBRARY") {
+    searchPackText(message.query)
+      .then((packIds) => sendResponse({ packIds }))
+      .catch(() => sendResponse({ packIds: [] }));
+    return true;
+  }
+  if (message?.type === "GET_PACK_ISSUES") {
+    getPackIssues(String(message.packId || ""))
+      .then((issues) => sendResponse({ issues }))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+  if (message?.type === "RENAME_FOLDER") {
+    renameFolder(String(message.id || ""), message.name)
+      .then((folder) => sendResponse({ ok: true, folder }))
       .catch((error) => sendResponse({ error: error.message }));
     return true;
   }
@@ -1369,9 +1465,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "CREATE_FOLDER") {
-    const name = String(message.name || "New folder").trim();
+    const name = String(message.name || "").trim().slice(0, FOLDER_NAME_LIMIT);
     if (!name) {
-      sendResponse({ error: "Folder name is required." });
+      sendResponse({ error: "Give the folder a name." });
       return false;
     }
     listFolders()

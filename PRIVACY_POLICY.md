@@ -6,9 +6,9 @@ PagePack saves web pages for offline reading. Privacy is part of that purpose: t
 
 ## Data PagePack handles
 
-When you click **Save page**, PagePack accesses the current page’s URL, title, visible document content, styles, images, fonts, direct media, and linked same-site pages you asked it to capture. When you start **Save as you browse**, PagePack accesses the pages you visit in the starting tab and child tabs opened from it until you choose Done or Discard journey. PagePack stores that material locally in your browser’s IndexedDB storage. PagePack also stores local preferences, folders, monthly page-allowance usage, and capture status.
+When you click **Save page**, PagePack accesses the current page’s URL, title, visible document content, styles, images, fonts, direct media, and linked same-site pages you asked it to capture. When you start **Save as I browse**, PagePack accesses the pages you visit in the starting tab and child tabs opened from it until you save or discard that collection. PagePack stores that material locally in your browser’s IndexedDB storage. PagePack also stores local preferences, folders, monthly page-allowance usage, and capture status.
 
-PagePack does not sell this data, use it for advertising, send it to the PagePack developer, or use it to build a browsing history. Page access exists only to provide saving, journey capture, offline reading, saved-link navigation, and offline fallback—the extension’s disclosed user-facing features.
+PagePack does not sell this data, use it for advertising, send it to the PagePack developer, or use it to build a browsing history. Page access exists only to provide saving, collecting as you browse, offline reading, saved-link navigation, and offline fallback—the extension’s disclosed user-facing features.
 
 ## PagePack Pro and payments
 

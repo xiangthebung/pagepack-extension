@@ -1,0 +1,14 @@
+{
+  "name": "pagepack-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Development manifest for the PagePack test suite. The extension itself ships without dependencies.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"tests/*.test.mjs\"",
+    "visual": "node tests/visual-server.mjs"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.2.5"
+  }
+}
