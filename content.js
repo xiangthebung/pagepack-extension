@@ -30,14 +30,50 @@ function replaceCssUrls(cssText, collect, baseUrl) {
   });
 }
 
+/**
+ * Tokenise every candidate URL in a `srcset` value.
+ *
+ * Deliberately identical to `rewriteSrcset` in `background.js`, which does the
+ * same job for a page fetched as a followed link. The two cannot share one
+ * module: that file is the module service worker, this one is injected into the
+ * page by `chrome.scripting.executeScript`, and an injected file cannot carry
+ * `import`. Injecting a second file to share it would put the helper on the
+ * page's own globals, which is a worse trade than a copy. Keep the two bodies
+ * byte-identical — `tests/srcset.test.mjs` compares them and fails if they drift
+ * — because a `srcset` the browser parses differently from PagePack is a broken
+ * image offline, and that is the whole reason this function exists.
+ *
+ * Splitting is by the HTML rules, not by commas: a candidate's URL runs to the
+ * next whitespace, so a comma inside a URL stays in it, and only a comma at the
+ * end of the URL ends the candidate. Everything that is not a URL — separators,
+ * descriptors, newlines — is copied through untouched, because whitespace is what
+ * tells a URL from its descriptor.
+ */
 function rewriteSrcset(value, collect, baseUrl) {
-  return String(value || "").split(",").map((candidate) => {
-    const parts = candidate.trim().split(/\s+/);
-    const token = collect(parts[0], "image", baseUrl);
-    if (!token) return candidate;
-    parts[0] = token;
-    return parts.join(" ");
-  }).join(", ");
+  const source = String(value || "");
+  let output = "";
+  let index = 0;
+  while (index < source.length) {
+    const separatorStart = index;
+    while (index < source.length && /[\s,]/.test(source[index])) index += 1;
+    output += source.slice(separatorStart, index);
+    const urlStart = index;
+    while (index < source.length && !/\s/.test(source[index])) index += 1;
+    const rawUrl = source.slice(urlStart, index);
+    const url = rawUrl.replace(/,+$/, "");
+    const token = url ? collect(url, "image", baseUrl) : null;
+    output += `${token || url}${rawUrl.slice(url.length)}`;
+    const descriptorStart = index;
+    // Parentheses can hold a comma that does not end the candidate.
+    let depth = 0;
+    while (index < source.length && (depth > 0 || source[index] !== ",")) {
+      if (source[index] === "(") depth += 1;
+      else if (source[index] === ")") depth = Math.max(0, depth - 1);
+      index += 1;
+    }
+    output += source.slice(descriptorStart, index);
+  }
+  return output;
 }
 
 function prepareDocument(options) {

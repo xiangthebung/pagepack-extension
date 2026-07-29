@@ -25,18 +25,37 @@ PagePack is a Manifest V3 Chrome extension for saving a page as a self-contained
 
 ## Install locally
 
+```
+npm run build
+```
+
 1. Open `chrome://extensions`.
 2. Turn on **Developer mode**.
 3. Choose **Load unpacked**.
-4. Select this `pagepack-extension` folder.
+4. Select the `dist/` folder.
+
+Load `dist/`, not the repository root. The extension is plain ES modules with no
+dependencies, so the build is only a copy — but it is the same one-line command
+and the same `dist/` target as every other extension in this workspace, and the
+store artifact is packaged from that exact output so it cannot fall behind the
+source the way a hand-assembled zip does.
+
+The copy is an explicit allowlist in `scripts/build.mjs`, so tests, docs and
+store assets are never shipped. The build then reads `dist/` back and resolves
+every reference the manifest, HTML and JS modules make; anything missing fails
+the build rather than producing a popup that silently does nothing.
 
 ## Development
 
-The extension ships with no runtime dependencies; `package.json` exists only for the test suite.
+The extension ships with no runtime dependencies; `package.json` exists only for the test suite and the build.
 
 ```
 npm install     # installs fake-indexeddb for the storage-backed tests
+npm run build   # assemble dist/
+npm run watch   # reassemble on change
 npm test        # runs tests/*.test.mjs
+npm run verify  # tests + build
+npm run zip     # build, then artifacts/pagepack-<version>.zip (verified)
 npm run visual  # serves the popup at http://127.0.0.1:41731 with a mocked chrome API
 ```
 
@@ -46,9 +65,10 @@ The visual server accepts `?plan=pro`, `?journey=1`, and `?slow=1`, plus the `#l
 
 1. Create an ExtensionPay account and connect the Stripe account that will receive payments.
 2. Register the ExtensionPay extension using the permanent ID `pagepack` (the dashboard may display `pagepack-offline-web-clipper` as the editable extension name).
-3. Add CAD monthly and yearly plans matching the in-product copy: **CAD $1.99/month** and **CAD $9.99/year**. If you choose different pricing or a different ExtensionPay ID, update `PRICING` in `monetization.js` and the price shown in `popup.html`.
-4. Complete a test checkout, cancellation, sign-in/restore, and expired-payment test in an unpacked build.
-5. Replace every `[YOUR SUPPORT EMAIL]` placeholder in the policy files, publish the policies on a public HTTPS page, and add those URLs to the Chrome Web Store listing and checkout flow.
+3. Add a monthly and a yearly plan. **The prices live only in that dashboard.** The popup reads them from `/api/v2/current-plans` through `pricing.js` and renders whatever it is told, so changing a price needs no code change here — and there is nothing in this repository to keep in sync. If the provider cannot be reached, the card says the price is shown at checkout rather than guessing.
+   Two places still state a price in prose and do need updating by hand if you change one: `TERMS_OF_SALE.md` and `STORE_LISTING.md`.
+4. Complete a test checkout, cancellation, sign-in/restore, and expired-payment test in an unpacked build. Check that the Pro card shows the amounts you configured, not a fallback sentence — a fallback means the plans request failed.
+5. The policies in `PRIVACY_POLICY.md` and `TERMS_OF_SALE.md` are published at `/legal/pagepack/privacy` and `/legal/pagepack/terms` on the developer's site; put those URLs in the Chrome Web Store listing. Edit the files here, not the published copies: the site keeps a copy and its test suite diffs the two.
 
 Do not publish the quota-enabled build until checkout and restore have both been tested. The Chrome Web Store does not process PagePack subscriptions.
 
