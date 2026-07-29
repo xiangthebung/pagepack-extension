@@ -1,8 +1,12 @@
 import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = new URL("../", import.meta.url).pathname;
+// `fileURLToPath`, not `.pathname`: the latter keeps the URL percent-encoding, so
+// a checkout under a directory with a space in its name ("bing bong") becomes
+// "bing%20bong" and every file read here fails as a 404.
+const root = fileURLToPath(new URL("../", import.meta.url));
 const port = Number(process.env.PAGEPACK_TEST_PORT || 41731);
 
 const mockChrome = `<script>
@@ -33,7 +37,9 @@ const mockChrome = `<script>
       sendMessage(message, callback) {
         window.__lastRuntimeMessage = message;
         if (message.type === 'LIST_LIBRARY') reply(callback, { packs, folders, captures: [], journeys });
-        else if (message.type === 'GET_MONETIZATION') reply(callback, { state: { entitlement: { paid }, usage: { pages: 9 }, remaining: paid ? null : 16, pricing: { freePagesPerMonth: 25, currency: 'CAD', monthlyPrice: 'CAD $1.99/month', yearlyPrice: 'CAD $9.99/year' }, payment: { configured: true, plans: [{ unitAmountCents: 199, currency: 'cad', interval: 'month' }, { unitAmountCents: 999, currency: 'cad', interval: 'year' }] } } });
+        // Prices reach the popup through payment.plans only. \`pricing\` deliberately
+        // carries none any more, so this mock matches the real state object.
+        else if (message.type === 'GET_MONETIZATION') reply(callback, { state: { entitlement: { paid }, usage: { pages: 9 }, remaining: paid ? null : 16, pricing: { freePagesPerMonth: 25 }, payment: { configured: true, plans: [{ unitAmountCents: 199, currency: 'cad', interval: 'month', intervalCount: 1 }, { unitAmountCents: 999, currency: 'cad', interval: 'year', intervalCount: 1 }] } } });
         else if (message.type === 'DELETE_PACK') {
           const index = packs.findIndex(pack => pack.id === message.id);
           if (index >= 0) packs.splice(index, 1);

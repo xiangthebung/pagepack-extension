@@ -5,8 +5,13 @@
   "description": "Development manifest for the PagePack test suite. The extension itself ships without dependencies.",
   "type": "module",
   "scripts": {
+    "clean": "node scripts/build.mjs --clean-only",
+    "build": "node scripts/build.mjs",
+    "watch": "node scripts/build.mjs --watch",
+    "zip": "node scripts/build.mjs --zip",
     "test": "node --test \"tests/*.test.mjs\"",
-    "visual": "node tests/visual-server.mjs"
+    "visual": "node tests/visual-server.mjs",
+    "verify": "npm run test && npm run build"
   },
   "devDependencies": {
     "fake-indexeddb": "6.2.5"

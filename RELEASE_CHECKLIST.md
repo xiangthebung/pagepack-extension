@@ -4,9 +4,10 @@
 
 - [ ] Create and verify the Chrome Web Store developer account, including 2-Step Verification and the one-time registration fee.
 - [ ] Choose the permanent publisher email carefully; Chrome does not let you change the account email later.
-- [ ] Replace `[YOUR SUPPORT EMAIL]` in `PRIVACY_POLICY.md` and `TERMS_OF_SALE.md`.
-- [ ] Host the privacy policy and terms/refund policy on stable public HTTPS URLs.
-- [ ] Register the ExtensionPay permanent ID `pagepack` (the editable dashboard name may be `pagepack-offline-web-clipper`), connect Stripe, and configure CAD $1.99 monthly and CAD $9.99 yearly plans.
+- [x] Replace `[YOUR SUPPORT EMAIL]` in `PRIVACY_POLICY.md` and `TERMS_OF_SALE.md`. Both now read `xiangli3625@gmail.com`.
+- [x] Host the privacy policy and terms/refund policy on stable public HTTPS URLs: `/legal/pagepack/privacy` and `/legal/pagepack/terms` on the developer's site. The site holds a copy and its tests diff it against the files here, so edit these and re-copy — never the other way round.
+- [ ] Register the ExtensionPay permanent ID `pagepack` (the editable dashboard name may be `pagepack-offline-web-clipper`), connect Stripe, and configure a monthly and a yearly plan. The amounts live only in that dashboard now; the popup reads them at runtime. `TERMS_OF_SALE.md` and `STORE_LISTING.md` still state CAD $1.99 and CAD $9.99 in prose, so change those two by hand if you price it differently.
+- [ ] Open the Pro card in an unpacked build and confirm it shows the configured amounts. "The price and billing period are shown at checkout" means the plans request failed, not that pricing is missing.
 - [ ] Ensure ExtensionPay/Stripe show the PagePack developer as seller and link the hosted terms, refund policy, privacy policy, and support contact.
 - [ ] Test checkout, restore/sign-in, cancellation, failed renewal, the seven-day offline grace period, and a new calendar month.
 - [ ] Test a free linked-page save that exceeds the remaining allowance, confirm the complete interaction is saved, and confirm the next save is blocked.

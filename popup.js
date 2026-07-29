@@ -1,5 +1,6 @@
 import { removePackPageFromPack } from "./pack-page.js";
 import { DEFAULT_PACK_LIMITS, normalizePackLimits } from "./monetization.js";
+import { priceLines } from "./pricing.js";
 
 const $ = (selector) => document.querySelector(selector);
 const ROOT_FOLDER = "__root__";
@@ -468,6 +469,40 @@ function renderSaveView() {
   }
 }
 
+/**
+ * The two price lines on the Pro card.
+ *
+ * Whatever ExtensionPay reported, or a sentence pointing at checkout if it
+ * reported nothing usable. There is deliberately no branch that falls back to a
+ * number, because a stale hardcoded price above the upgrade button is exactly the
+ * bug this replaced.
+ */
+function renderProPrice(paid) {
+  const price = $("#pro-price");
+  const alt = $("#pro-price-alt");
+
+  if (paid) {
+    price.hidden = true;
+    price.replaceChildren();
+    alt.textContent = "Unlimited saves are active on this browser.";
+    return;
+  }
+
+  const { main, alt: altText } = priceLines(monetization?.payment?.plans);
+  price.hidden = !main;
+  if (main) {
+    const amount = document.createElement("strong");
+    amount.textContent = main.amount;
+    const period = document.createElement("span");
+    period.textContent = main.period;
+    price.replaceChildren(amount, period);
+  } else {
+    price.replaceChildren();
+  }
+  alt.textContent = altText || "";
+  alt.hidden = !altText;
+}
+
 function renderPlan() {
   const chip = $("#plan-chip");
   const summary = $("#plan-summary");
@@ -488,10 +523,7 @@ function renderPlan() {
   summary.title = paid ? "PagePack Pro: unlimited page saves" : `${savesLeft()} of ${freeLimit} free saves left this month`;
 
   $("#pro-title").textContent = paid ? "You’re on Pro" : "Unlimited monthly saves";
-  $("#pro-price").hidden = paid;
-  $("#pro-price-alt").textContent = paid
-    ? "Unlimited saves are active on this browser."
-    : `or ${monetization.pricing?.yearlyPrice || "CAD $9.99/year"} — over half off`;
+  renderProPrice(paid);
   $("#upgrade-button").hidden = paid;
   $("#manage-button").hidden = !paid;
   $("#restore-button").hidden = paid;

@@ -1,10 +1,18 @@
+import { normalizePlans } from "./pricing.js";
 import { getSetting, setSetting } from "./storage.js";
 
+/**
+ * Prices are deliberately absent from here.
+ *
+ * They used to be: `monthlyPrice: "CAD $1.99/month"` and a matching yearly
+ * string. Both were duplicated into `popup.html`, and neither had any connection
+ * to the amounts configured in the ExtensionPay dashboard, so the moment a price
+ * changed the popup would confidently show the old one right above the button
+ * that charges the new one. The amounts now come from `/api/v2/current-plans`
+ * through `getMonetizationState().payment.plans`; see `pricing.js`.
+ */
 export const PRICING = Object.freeze({
   freePagesPerMonth: 25,
-  currency: "CAD",
-  monthlyPrice: "CAD $1.99/month",
-  yearlyPrice: "CAD $9.99/year",
   // Permanent ID shown by the ExtensionPay dashboard: ExtPay('pagepack').
   extensionPayId: "pagepack",
 });
@@ -37,8 +45,11 @@ export function effectivePackLimits(value, isPaid) {
 const USAGE_KEY = "pagepack-usage-v1";
 const PAYMENT_CACHE_KEY = "pagepack-payment-cache-v2";
 const PAYMENT_API_KEY = "pagepack-extensionpay-key-v2";
+const PLANS_CACHE_KEY = "pagepack-plans-cache-v1";
 const PAYMENT_HOST = "https://extensionpay.com";
 const PAID_OFFLINE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+/** Prices change rarely; a day-old one beside a governing checkout page is fine. */
+const PLANS_TTL_MS = 24 * 60 * 60 * 1000;
 
 function storageGet(keys) {
   return new Promise((resolve, reject) => {
@@ -141,16 +152,43 @@ async function fetchPaymentUser() {
   return user;
 }
 
-async function getProviderStatus() {
+async function fetchProviderStatus() {
+  const response = await fetch(extensionUrl("/api/v2/current-plans"), {
+    headers: { Accept: "application/json" },
+  });
+  if (response.status === 404) return { configured: false, plans: [] };
+  if (!response.ok) return { configured: null, plans: [] };
+  const body = await response.json();
+  return {
+    configured: Array.isArray(body) && body.length > 0,
+    plans: normalizePlans(body),
+  };
+}
+
+/**
+ * Whether checkout is connected, and at what prices.
+ *
+ * Cached for a day, because the popup now needs the prices every time the Pro
+ * card is opened and asking a payment provider what its prices are on every
+ * single popup open would be rude to both ends. A day-old price sitting next to a
+ * checkout page that governs the sale is a reasonable trade; a price compiled into
+ * the extension months ago was not.
+ *
+ * A failed request falls back to the cache at any age, then to "unknown". It never
+ * invents a price, because `plans: []` renders as a sentence rather than a number.
+ */
+async function getProviderStatus({ refresh = false } = {}) {
+  const stored = await storageGet([PLANS_CACHE_KEY]);
+  const cached = stored[PLANS_CACHE_KEY] || null;
+  const fresh = cached && Date.now() - Number(cached.fetchedAt || 0) < PLANS_TTL_MS;
+  if (!refresh && fresh) return { configured: cached.configured, plans: cached.plans || [] };
+
   try {
-    const response = await fetch(extensionUrl("/api/v2/current-plans"), {
-      headers: { Accept: "application/json" },
-    });
-    if (response.status === 404) return { configured: false, plans: [] };
-    if (!response.ok) return { configured: null, plans: [] };
-    const plans = await response.json();
-    return { configured: Array.isArray(plans) && plans.length > 0, plans: Array.isArray(plans) ? plans : [] };
+    const status = await fetchProviderStatus();
+    await storageSet({ [PLANS_CACHE_KEY]: { ...status, fetchedAt: Date.now() } });
+    return status;
   } catch {
+    if (cached) return { configured: cached.configured, plans: cached.plans || [] };
     return { configured: null, plans: [] };
   }
 }
@@ -177,7 +215,10 @@ export async function getMonetizationState({ refresh = false } = {}) {
   const [entitlement, usage, payment] = await Promise.all([
     getEntitlement({ refresh }),
     getUsage(),
-    refresh ? getProviderStatus() : Promise.resolve({ configured: null, plans: [] }),
+    // Asked for every time now, not only on an explicit refresh: the Pro card
+    // cannot show a price it never fetched, and the day-long cache means this is
+    // a request roughly once a day rather than once a popup.
+    getProviderStatus({ refresh }),
   ]);
   const remaining = entitlement.paid
     ? null

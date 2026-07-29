@@ -34,4 +34,4 @@ Material changes to this policy or PagePack’s data practices will be disclosed
 
 ## Contact
 
-Questions, deletion requests concerning payment-account data, or privacy concerns: **[YOUR SUPPORT EMAIL]**.
+Questions, deletion requests concerning payment-account data, or privacy concerns: **xiangli3625@gmail.com**.

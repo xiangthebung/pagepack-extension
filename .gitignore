@@ -1,3 +1,10 @@
 node_modules/
+
+# Build output. Assembled by `npm run build`; load this in Chrome.
 dist/
+
+# Store upload artifacts, produced by `npm run zip`.
+artifacts/
+*.zip
+
 .DS_Store

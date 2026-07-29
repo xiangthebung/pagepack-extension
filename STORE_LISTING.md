@@ -52,8 +52,28 @@ Certify that the data is not sold, is not used for advertising or credit decisio
 
 ## Required visual assets
 
-- Store icon: `icons/icon-128.png`.
-- Store screenshot: `store-assets/screenshot-save-1280x800.png`. Recommended follow-up set: Library with folders, saved-page reader, and Pro view.
-- Small promotional tile: `store-assets/promo-440x280.png`.
+All produced from `dist/` — the directory `npm run zip` packages — by:
+
+```
+npm run build && node scripts/store-shots.mjs
+```
+
+The script loads the built extension into a real Chromium, uses it, photographs the result, and measures every file it writes from the PNG header before exiting; a file that is off by a pixel fails the run rather than the upload. It needs Playwright, which is not a dependency of the extension: `npm install --no-save playwright` once.
+
+- Store icon: `dist/icons/icon-128.png` (`icons/icon-128.png` in the source tree).
+- Screenshots, all exactly 1280×800:
+  - `store-assets/01-save-1280x800.png` — a capture in flight: the popup's progress card reporting a real file count against a page whose assets are still arriving, with the cancel button in view.
+  - `store-assets/02-library-1280x800.png` — the library at the top level, a folder with the pages of one save listed inside it, and a full-text search matching three items by their captured text rather than their titles.
+  - `store-assets/03-reader-1280x800.png` — the saved-page reader, with page-to-page navigation and the “✓ Saved” badge on links that open offline.
+  - `store-assets/04-offline-1280x800.png` — Chromium with its network switched off: the popup declining to start a save, beside a saved address that failed to load and was opened from disk instead.
+- Small promotional tile: `store-assets/promo-440x280.png`, exactly 440×280. `store-assets/promo-440x280.svg` is the hand-drawn original the tile follows; keep the two in step if either changes.
+
+Every pixel of PagePack in those screenshots was rendered by the shipped build, driven through its own interface. The pages being saved are an invented publication served from a local server for the run; it names, depicts and imitates nobody, says so in its own masthead, and the composition repeats it in the corner of every shot.
 
 Do not claim that every website or streaming video can be saved. Do not omit the free allowance or Pro pricing from the listing.
+
+## Claims to avoid
+
+Everything below is something the code cannot support. Keeping it out of the listing is not modesty; each one is a refund request or a rejection waiting to happen.
+
+- **Do not claim a saved page with scripts enabled can make no outbound request at all.** The sandbox CSP blocks the ways a page fetches things — `connect-src 'none'` covers fetch, XHR, WebSocket, EventSource, `sendBeacon` and worker requests, remote images, scripts, stylesheets and fonts are refused, and `form-action 'none'` blocks form submission — but a saved script can still navigate the reader's own frame, by assigning to `location`, and no CSP directive prevents that. The verified claim is the narrower one already in the description: the sandboxed reader blocks saved pages from reaching your cookies, extension data or the network. Say that, not "cannot reach the internet".

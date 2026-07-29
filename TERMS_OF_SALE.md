@@ -14,7 +14,7 @@ You can cancel at any time through **Manage subscription** in PagePack. Cancella
 
 ## Refunds
 
-You may request a refund for a first subscription payment within 14 days of purchase. You may request a refund for an accidental renewal within 7 days of the renewal. Refunds are not prorated after those windows, except where required by law. Contact **[YOUR SUPPORT EMAIL]** and include the email used at checkout.
+You may request a refund for a first subscription payment within 14 days of purchase. You may request a refund for an accidental renewal within 7 days of the renewal. Refunds are not prorated after those windows, except where required by law. Contact **xiangli3625@gmail.com** and include the email used at checkout.
 
 ## Availability and changes
 
@@ -22,4 +22,4 @@ PagePack is provided on an as-available basis. Website structure, access control
 
 ## Contact
 
-Billing and support: **[YOUR SUPPORT EMAIL]**.
+Billing and support: **xiangli3625@gmail.com**.

@@ -237,6 +237,52 @@ function classifyResource(tagName, attrName, tagText, options) {
   return null;
 }
 
+/**
+ * Tokenise every candidate URL in a `srcset` value.
+ *
+ * Deliberately identical to `rewriteSrcset` in `content.js`, which does the same
+ * job for a page read out of the live tab. The two cannot share one module: this
+ * file is the module service worker, that one is injected into the page by
+ * `chrome.scripting.executeScript`, and an injected file cannot carry `import`.
+ * Injecting a second file to share it would put the helper on the page's own
+ * globals, which is a worse trade than a copy. Keep the two bodies byte-identical
+ * — `tests/srcset.test.mjs` compares them and fails if they drift — because a
+ * `srcset` the browser parses differently from PagePack is a broken image
+ * offline, and that is the whole reason this function exists.
+ *
+ * Splitting is by the HTML rules, not by commas: a candidate's URL runs to the
+ * next whitespace, so a comma inside a URL stays in it, and only a comma at the
+ * end of the URL ends the candidate. Everything that is not a URL — separators,
+ * descriptors, newlines — is copied through untouched, because whitespace is what
+ * tells a URL from its descriptor.
+ */
+function rewriteSrcset(value, collect, baseUrl) {
+  const source = String(value || "");
+  let output = "";
+  let index = 0;
+  while (index < source.length) {
+    const separatorStart = index;
+    while (index < source.length && /[\s,]/.test(source[index])) index += 1;
+    output += source.slice(separatorStart, index);
+    const urlStart = index;
+    while (index < source.length && !/\s/.test(source[index])) index += 1;
+    const rawUrl = source.slice(urlStart, index);
+    const url = rawUrl.replace(/,+$/, "");
+    const token = url ? collect(url, "image", baseUrl) : null;
+    output += `${token || url}${rawUrl.slice(url.length)}`;
+    const descriptorStart = index;
+    // Parentheses can hold a comma that does not end the candidate.
+    let depth = 0;
+    while (index < source.length && (depth > 0 || source[index] !== ",")) {
+      if (source[index] === "(") depth += 1;
+      else if (source[index] === ")") depth = Math.max(0, depth - 1);
+      index += 1;
+    }
+    output += source.slice(descriptorStart, index);
+  }
+  return output;
+}
+
 function tokenizeCss(cssText, pageUrl, registerResource) {
   const withImports = String(cssText || "").replace(/@import\s+(?:url\(\s*)?(["']?)([^"')\s]+)\1\s*\)?/gi, (full, quote, value) => {
     const token = registerResource(value.trim(), "style", pageUrl);
@@ -249,29 +295,13 @@ function tokenizeCss(cssText, pageUrl, registerResource) {
   });
 }
 
-function extractAndTokenizeResources(html, pageUrl, options) {
+// Exported for `tests/srcset.test.mjs`, which reads a fetched page through this
+// function rather than asserting against a copy of its parsing.
+export function extractAndTokenizeResources(html, pageUrl, options) {
   let resourceIndex = 0;
   const resources = [];
   const seen = new Map();
-  const tagPattern = /<([a-z][\w:-]*)\b[^>]*>/gi;
-  let result = String(html || "").replace(tagPattern, (tagText, tagName) => {
-    if (["a", "base", "meta", "form"].includes(tagName.toLowerCase())) return tagText;
-    if (tagName.toLowerCase() === "link" && !/rel\s*=\s*["'][^"']*stylesheet/i.test(tagText)) return "";
-    return tagText.replace(/\s(src|href|poster)\s*=\s*(["'])(.*?)\2/i, (whole, attrName, quote, rawUrl) => {
-      const kind = classifyResource(tagName, attrName, tagText, options);
-      const url = normalizeUrl(rawUrl, pageUrl);
-      if (!kind || !url || !isHttpUrl(url)) return whole;
-      const key = `${kind}:${url}`;
-      let token = seen.get(key);
-      if (!token) {
-        token = makeToken(resourceIndex++);
-        seen.set(key, token);
-        resources.push({ token, url, kind });
-      }
-      return ` ${attrName}=${quote}${token}${quote}`;
-    });
-  });
-  const registerCssResource = (value, kind, baseUrl) => {
+  const registerResource = (value, kind, baseUrl) => {
     const url = normalizeUrl(value, baseUrl);
     if (!url || !isHttpUrl(url)) return null;
     const key = `${kind}:${url}`;
@@ -283,8 +313,32 @@ function extractAndTokenizeResources(html, pageUrl, options) {
     }
     return token;
   };
-  result = result.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi, (full, start, css, end) => `${start}${tokenizeCss(css, pageUrl, registerCssResource)}${end}`);
-  result = result.replace(/\sstyle\s*=\s*(["'])([\s\S]*?)\1/gi, (full, quote, css) => ` style=${quote}${tokenizeCss(css, pageUrl, registerCssResource)}${quote}`);
+  const tagPattern = /<([a-z][\w:-]*)\b[^>]*>/gi;
+  let result = String(html || "").replace(tagPattern, (tagText, tagName) => {
+    const tag = tagName.toLowerCase();
+    if (["a", "base", "meta", "form"].includes(tag)) return tagText;
+    if (tag === "link" && !/rel\s*=\s*["'][^"']*stylesheet/i.test(tagText)) return "";
+    const rewritten = tagText.replace(/\s(src|href|poster)\s*=\s*(["'])(.*?)\2/i, (whole, attrName, quote, rawUrl) => {
+      const kind = classifyResource(tagName, attrName, tagText, options);
+      const token = kind ? registerResource(rawUrl, kind, pageUrl) : null;
+      if (!token) return whole;
+      return ` ${attrName}=${quote}${token}${quote}`;
+    });
+    // `srcset` as well as `src`, and on the same two elements `content.js` covers:
+    // the browser prefers a candidate from `srcset`, so leaving it alone left the
+    // saved page pointing at the network and broken offline.
+    if (tag !== "img" && tag !== "source") return rewritten;
+    // Candidates are registered under the kind this path already gives the
+    // element's own `src`, so the candidate that repeats the `src` — which is most
+    // responsive markup — is one resource rather than a second copy of the same
+    // bytes in the pack.
+    const candidateKind = classifyResource(tag, "src", tagText, options) || "image";
+    const collectCandidate = (value, _kind, baseUrl) => registerResource(value, candidateKind, baseUrl);
+    return rewritten.replace(/\ssrcset\s*=\s*(["'])([\s\S]*?)\1/i, (whole, quote, rawValue) =>
+      ` srcset=${quote}${rewriteSrcset(rawValue, collectCandidate, pageUrl)}${quote}`);
+  });
+  result = result.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi, (full, start, css, end) => `${start}${tokenizeCss(css, pageUrl, registerResource)}${end}`);
+  result = result.replace(/\sstyle\s*=\s*(["'])([\s\S]*?)\1/gi, (full, quote, css) => ` style=${quote}${tokenizeCss(css, pageUrl, registerResource)}${quote}`);
   if (!options.runScripts) {
     result = result.replace(/<script\b[\s\S]*?<\/script>/gi, "").replace(/\s(on[a-z]+)\s*=\s*(["'])[^"']*\2/gi, "");
   }
