@@ -1,0 +1,31 @@
+name: verify
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: tests + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run verify
+
+      - run: npm run zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pagepack-unpacked
+          path: dist/
+          if-no-files-found: error

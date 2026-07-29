@@ -162,10 +162,83 @@ assert.equal(srcsetAttribute(tokenize('<img srcset="">').html), "");
 const others = tokenize(`<link rel="stylesheet" href="/style.css">
 <video src="/media/clip.mp4" poster="/img/poster.png"></video>
 <div style="background-image:url(/img/tile.png)"></div>`);
+// The poster belongs here. This assertion used to list three resources and leave
+// it out, which is how the bug survived: the attribute rewrite was not global, so
+// it took `src` and stopped, and the test recorded that as the expected answer.
 assert.deepEqual(others.resources.map((resource) => `${resource.kind} ${resource.url}`), [
   "style https://example.test/style.css",
   "media https://example.test/media/clip.mp4",
+  "media https://example.test/img/poster.png",
   "asset https://example.test/img/tile.png",
+]);
+assert.equal(/https?:\/\//.test(others.html), false);
+
+/* ------------------------------------------------------------------ *
+ * Every addressable attribute on a tag, not just the first one
+ * ------------------------------------------------------------------ */
+
+// A video carries both, and the poster is the frame shown before playback — the
+// one part of it a reader sees without pressing anything.
+const posterAndSrc = tokenize('<video src="/media/clip.mp4" poster="/img/poster.png"></video>');
+assert.deepEqual(posterAndSrc.resources.map((resource) => resource.url), [
+  "https://example.test/media/clip.mp4",
+  "https://example.test/img/poster.png",
+]);
+assert.match(posterAndSrc.html, /\ssrc="__PAGEPACK_RESOURCE_0__"/);
+assert.match(posterAndSrc.html, /\sposter="__PAGEPACK_RESOURCE_1__"/);
+
+// Order must not matter: the rewrite walks the tag, it does not know which
+// attribute an author wrote first.
+const posterFirst = tokenize('<video poster="/img/poster.png" src="/media/clip.mp4"></video>');
+assert.deepEqual(posterFirst.resources.map((resource) => resource.url), [
+  "https://example.test/img/poster.png",
+  "https://example.test/media/clip.mp4",
+]);
+assert.equal(/https?:\/\//.test(posterFirst.html), false);
+
+// All three attributes on one tag, with `srcset` alongside them.
+const everything = tokenize('<img src="/img/a.png" srcset="/img/a@2x.png 2x" poster="/img/p.png">');
+assert.deepEqual(everything.resources.map((resource) => resource.url), [
+  "https://example.test/img/a.png",
+  "https://example.test/img/p.png",
+  "https://example.test/img/a@2x.png",
+]);
+assert.equal(/https?:\/\//.test(everything.html), false);
+
+// With media capture off a video keeps neither attribute, so switching it off
+// cannot leave half a remote video behind.
+const noMedia = tokenize('<video src="/media/clip.mp4" poster="/img/poster.png"></video>', {
+  captureMedia: false,
+});
+assert.deepEqual(noMedia.resources, []);
+assert.match(noMedia.html, /src="\/media\/clip\.mp4"/);
+assert.match(noMedia.html, /poster="\/img\/poster\.png"/);
+
+/* ------------------------------------------------------------------ *
+ * A placeholder is not a resource
+ * ------------------------------------------------------------------ */
+
+// `#` and `#anchor` are placeholders. `normalizeUrl` clears the hash, so each of
+// these resolved to the page's own URL, passed the http test, and was saved as an
+// image of the page it appeared on.
+for (const placeholder of ["#", "#top", "  #  ", ""]) {
+  const result = tokenize(`<img src="${placeholder}">`);
+  assert.deepEqual(result.resources, [], `"${placeholder}" was registered as a resource`);
+  assert.equal(result.html.includes("__PAGEPACK_RESOURCE_"), false);
+}
+
+// A fragment-only candidate inside a srcset is left alone for the same reason.
+const fragmentCandidate = tokenize('<img srcset="# 1x, /img/a.png 2x">');
+assert.deepEqual(fragmentCandidate.resources.map((resource) => resource.url), [
+  "https://example.test/img/a.png",
+]);
+assert.equal(srcsetAttribute(fragmentCandidate.html), "# 1x, __PAGEPACK_RESOURCE_0__ 2x");
+
+// A real URL that happens to carry a fragment is still a resource, saved once
+// under its address without the fragment.
+const hashedUrl = tokenize('<img src="/img/a.png#frame-2"><img src="/img/a.png">');
+assert.deepEqual(hashedUrl.resources.map((resource) => resource.url), [
+  "https://example.test/img/a.png",
 ]);
 
 /* ------------------------------------------------------------------ *

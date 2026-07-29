@@ -302,7 +302,13 @@ export function extractAndTokenizeResources(html, pageUrl, options) {
   const resources = [];
   const seen = new Map();
   const registerResource = (value, kind, baseUrl) => {
-    const url = normalizeUrl(value, baseUrl);
+    const raw = String(value ?? "").trim();
+    /* Nothing to fetch. `normalizeUrl` clears the hash, so a placeholder like
+       `<img src="#">` or `<a href="#top">` resolved to the page's own address,
+       passed the http check, and was saved into the pack as an image of the page
+       it came from. */
+    if (!raw || raw.startsWith("#")) return null;
+    const url = normalizeUrl(raw, baseUrl);
     if (!url || !isHttpUrl(url)) return null;
     const key = `${kind}:${url}`;
     let token = seen.get(key);
@@ -318,7 +324,10 @@ export function extractAndTokenizeResources(html, pageUrl, options) {
     const tag = tagName.toLowerCase();
     if (["a", "base", "meta", "form"].includes(tag)) return tagText;
     if (tag === "link" && !/rel\s*=\s*["'][^"']*stylesheet/i.test(tagText)) return "";
-    const rewritten = tagText.replace(/\s(src|href|poster)\s*=\s*(["'])(.*?)\2/i, (whole, attrName, quote, rawUrl) => {
+    // Global. Without the `g` this rewrote the first of `src`, `href` and `poster`
+    // on a tag and stopped, so `<video src poster>` kept a remote poster and the
+    // reader drew a broken frame offline for exactly the markup a video needs.
+    const rewritten = tagText.replace(/\s(src|href|poster)\s*=\s*(["'])(.*?)\2/gi, (whole, attrName, quote, rawUrl) => {
       const kind = classifyResource(tagName, attrName, tagText, options);
       const token = kind ? registerResource(rawUrl, kind, pageUrl) : null;
       if (!token) return whole;
