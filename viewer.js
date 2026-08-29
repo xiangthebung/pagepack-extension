@@ -176,18 +176,28 @@ function hydrateMarkup(page, { runScripts = true } = {}) {
   const prelude = `${head}${runScripts ? storageShield : ""}`;
   if (/<head\b[^>]*>/i.test(markup)) markup = markup.replace(/<head\b[^>]*>/i, (match) => `${match}${prelude}`);
   else markup = `${prelude}${markup}`;
-  // The page's own address, for resolving relative links now that no `<base>` is
-  // injected. JSON-encoded so a URL containing a quote cannot end the string.
+  /* The bridge that reports clicks and submissions back to the reader.
+     PAGE_URL is the page's own address, for resolving relative links now that no
+     base element is injected; JSON-encoded so a URL containing a quote cannot end
+     the string.
+
+     Links opening in a new tab are intercepted like every other link. They used
+     to be waved through, so a link the save did not include opened the live page
+     with no warning, instead of the "that page isn't in this save" notice every
+     other link gets. The reader decides what opens online; the saved page does
+     not.
+
+     Nothing inside this template literal may contain a backtick. One in a comment
+     ends the string, and the file then fails to parse — which is a broken reader
+     and a passing unit test, because the tests that exercise this bridge rebuild
+     it rather than importing it. `tests/extension-loads.test.mjs` is what catches
+     it, by loading the built extension in a real browser. */
   const bridge = `<script>(function(){
     var PAGE_URL = ${JSON.stringify(String(page.url || ""))};
     document.addEventListener('click', function(event){
       if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
       var target = event.target && event.target.nodeType === 1 ? event.target : event.target && event.target.parentElement;
       var link = target && target.closest ? target.closest('a[href]') : null;
-      // `target="_blank"` is intercepted too. It used to be waved through, so a
-      // link the save did not include opened the live page with no warning,
-      // instead of the "that page isn't in this save" notice every other link
-      // gets. The reader decides what opens online; the saved page does not.
       if (!link) return;
       var href = link.getAttribute('href');
       if (!href || href.charAt(0) === '#') return;

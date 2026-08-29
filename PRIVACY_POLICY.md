@@ -1,12 +1,14 @@
 # PagePack Privacy Policy
 
-Effective: July 21, 2026
+Effective: August 29, 2026
 
 PagePack saves web pages for offline reading. Privacy is part of that purpose: the pages you save and your PagePack library remain on your device.
 
 ## Data PagePack handles
 
 When you click **Save page**, PagePack accesses the current page’s URL, title, visible document content, styles, images, fonts, direct media, and linked same-site pages you asked it to capture. When you start **Save as I browse**, PagePack accesses the pages you visit in the starting tab and child tabs opened from it until you save or discard that collection. PagePack stores that material locally in your browser’s IndexedDB storage. PagePack also stores local preferences, folders, monthly page-allowance usage, and capture status.
+
+To save a page completely, PagePack requests that page’s images, stylesheets, fonts, and linked pages using your browser’s existing session for that site, exactly as the browser would if you opened them yourself. This is what allows a page you are signed in to to be saved correctly. Those requests go to the site being saved and to no one else, and they stop when the save finishes.
 
 PagePack does not sell this data, use it for advertising, send it to the PagePack developer, or use it to build a browsing history. Page access exists only to provide saving, collecting as you browse, offline reading, saved-link navigation, and offline fallback—the extension’s disclosed user-facing features.
 
@@ -22,7 +24,11 @@ Saved pages remain until you delete them from the PagePack library or uninstall 
 
 ## Security
 
-Saved pages open in an isolated reader without access to extension APIs, browser cookies, local storage, or the network. Saved website scripts are enabled by default for faithful offline rendering and can be disabled per save.
+Saved pages open in an isolated reader with no access to extension APIs, browser cookies, or site storage, and no access to the network. Reading a saved page makes no network request of any kind: everything shown comes from the copy on your device.
+
+Three things hold that up. Anything in a page that would load from the network is rewritten during the save to point at the saved copy instead. Anything that would navigate away — including a page’s own refresh directive — is removed when the page is saved. And the reader runs saved pages under a policy that denies every category of network request by default, so anything the first two missed is refused by the browser rather than fetched. Following a link in a saved page moves to another saved page, or asks whether you want to open the live one; it never opens the live page on its own.
+
+Scripts saved with a page do not run when you open it. The reader shows a plain snapshot first, and you can turn the saved scripts on for that reading session if you want them. Saved scripts get an isolated, in-memory replacement for site storage and cannot reach the network either.
 
 ## Limited Use
 

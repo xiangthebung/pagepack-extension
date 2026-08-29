@@ -25,7 +25,7 @@ PagePack includes:
 - One-click capture of the page you are viewing, with live progress and a cancel button.
 - Save as I browse: PagePack collects the starting page, pages visited in that tab, and child tabs opened from it, then lets you review and untick pages before saving them as one item.
 - Optional same-site link following, up to three levels deep.
-- Folders, full-text search across saved page text, move and reorder by pointer or keyboard, and offline navigation between saved pages.
+- Folders, search across saved titles, addresses and page text, move and reorder by pointer or keyboard, and offline navigation between saved pages.
 - A reader with page-to-page navigation, the site’s live page one click away, and a clear “✓ Saved” badge on links that open offline.
 - Partial saves are reported plainly: each item shows what is missing and offers a retry.
 - A sandboxed reader that blocks saved pages from accessing your cookies, extension data, or the network.
@@ -58,7 +58,7 @@ All produced from `dist/` — the directory `npm run zip` packages — by:
 npm run build && node scripts/store-shots.mjs
 ```
 
-The script loads the built extension into a real Chromium, uses it, photographs the result, and measures every file it writes from the PNG header before exiting; a file that is off by a pixel fails the run rather than the upload. It needs Playwright, which is not a dependency of the extension: `npm install --no-save playwright` once.
+The script loads the built extension into a real Chromium, uses it, photographs the result, and measures every file it writes from the PNG header before exiting; a file that is off by a pixel fails the run rather than the upload. It uses Playwright, which is a development dependency of this repository — `npm install` is enough, plus `npx playwright install chromium` once for the browser itself.
 
 - Store icon: `dist/icons/icon-128.png` (`icons/icon-128.png` in the source tree).
 - Screenshots, all exactly 1280×800:
