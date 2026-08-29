@@ -790,10 +790,50 @@ async function captureLivePage(tabId, requestId, { runScripts, captureMedia }) {
 }
 
 let journeyBadge = { count: 0, active: false };
-let captureBadgeActive = false;
+let captureBadge = { active: false, pages: 0, following: false };
 
-// A badge is the only signal left once the popup closes, so it reports whether
-// PagePack is still collecting pages or finishing a save in the background.
+/** What a running save shows when it has no page count to report. */
+export const CAPTURE_WORKING_BADGE = "•";
+
+/**
+ * The badge text for a save in progress.
+ *
+ * Split out and exported so `tests/badge.test.mjs` can decide it exhaustively.
+ * The single-page rule cannot be tested through the browser: for a save with no
+ * linked pages, `pages` only reaches 1 after the last asset lands, and the badge
+ * is cleared a few milliseconds later, so the difference between counting and not
+ * counting is never on screen long enough to sample. An end-to-end assertion
+ * about it passed whether the rule was there or not — which is worse than no
+ * assertion, so the rule lives here where it can be checked directly.
+ */
+export function captureBadgeText({ following, pages }) {
+  if (!following || !(Number(pages) > 0)) return CAPTURE_WORKING_BADGE;
+  return Number(pages) > 99 ? "99+" : String(Number(pages));
+}
+
+/**
+ * The toolbar badge. The only signal left once the popup closes.
+ *
+ * Three states, and the colour is what separates the modes — not the glyph. At
+ * badge size a colour is legible at a glance and the difference between a dot and
+ * a digit is not, so red always means a collection is accumulating and blue
+ * always means a save is running.
+ *
+ * A link-following save counts pages as they land. It used to show a dot for the
+ * whole run, which answers "is it working" but not "is it stuck" — and those look
+ * identical for the several minutes a depth-3 crawl can take with the popup shut.
+ * A number that moves is the only liveness signal available there, and it matters
+ * more since resource fetches gained a deadline: a save that hits a slow host now
+ * recovers, and the badge is where that becomes visible.
+ *
+ * A single-page save keeps the dot. The count would read "1" for an instant at
+ * the very end and tell nobody anything, so the dot stays where it means
+ * something: working, one page, no progress to report.
+ *
+ * The number is pages *saved so far*, never pages remaining — it only goes up,
+ * which is the same thing the journey badge means, so the two modes do not read
+ * as different kinds of number.
+ */
 function paintActionBadge() {
   try {
     if (journeyBadge.active) {
@@ -803,10 +843,15 @@ function paintActionBadge() {
       chrome.action.setTitle({ title: `PagePack is collecting ${count} ${count === 1 ? "page" : "pages"}` });
       return;
     }
-    if (captureBadgeActive) {
+    if (captureBadge.active) {
+      const text = captureBadgeText(captureBadge);
       chrome.action.setBadgeBackgroundColor({ color: "#0a84ff" });
-      chrome.action.setBadgeText({ text: "•" });
-      chrome.action.setTitle({ title: "PagePack is saving this page" });
+      chrome.action.setBadgeText({ text });
+      chrome.action.setTitle({
+        title: text === CAPTURE_WORKING_BADGE
+          ? "PagePack is saving this page"
+          : `PagePack has saved ${captureBadge.pages} ${captureBadge.pages === 1 ? "page" : "pages"} so far`,
+      });
       return;
     }
     chrome.action.setBadgeText({ text: "" });
@@ -821,8 +866,24 @@ function updateJourneyBadge(count = 0, active = true) {
   paintActionBadge();
 }
 
-function setCaptureBadge(active) {
-  captureBadgeActive = Boolean(active);
+function setCaptureBadge(active, { following = false } = {}) {
+  captureBadge = { active: Boolean(active), pages: 0, following: Boolean(following) };
+  paintActionBadge();
+}
+
+/**
+ * Report a page landing in the save being captured.
+ *
+ * Repaints only when the number actually changes, which is once per page — at
+ * most a few hundred times across a whole save, against the four-a-second the
+ * progress messages already run at. It is deliberately not driven from
+ * `publishProgress`: that fires on asset completion too, and would repaint the
+ * badge thousands of times to show the same digit.
+ */
+function setCaptureBadgePages(pages) {
+  const count = Number(pages) || 0;
+  if (!captureBadge.active || count === captureBadge.pages) return;
+  captureBadge = { ...captureBadge, pages: count };
   paintActionBadge();
 }
 
@@ -1269,7 +1330,9 @@ async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, fol
     committed: false,
   };
   captureJobs.set(requestId, job);
-  setCaptureBadge(true);
+  // Only a link-following save has a page count worth showing; a single-page
+  // save keeps the plain dot.
+  setCaptureBadge(true, { following: clampDepth(depth) > 0 });
   const progress = {
     phase: "reading",
     pagesDone: 0,
@@ -1358,6 +1421,7 @@ async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, fol
     throwIfCaptureCancelled(requestId);
     processedPages += 1;
     progress.pagesDone = processedPages;
+    setCaptureBadgePages(processedPages);
     totalBytes += resourceResult.bytes;
     failures.push(...resourceResult.failures.map((failure) => ({ ...failure, type: "resource", pageUrl: page.url })));
     hydratedPages.add(page);

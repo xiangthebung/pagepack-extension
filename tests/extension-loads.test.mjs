@@ -61,8 +61,15 @@ async function check(name, run) {
  * ------------------------------------------------------------------ */
 
 const siteHits = [];
-const server = createServer((request, response) => {
+/* Every response is delayed by this much while the badge is being watched.
+   Against an instant local server a whole two-page save finishes inside a single
+   sampling interval, so the badge would be observed only as "" and a real,
+   working count would look like an absent one. A slow site is also the case the
+   badge exists for. */
+let responseDelayMs = 0;
+const server = createServer(async (request, response) => {
   siteHits.push(request.url);
+  if (responseDelayMs) await new Promise((resolve) => setTimeout(resolve, responseDelayMs));
   if (request.url.startsWith("/torture")) {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     response.end(fixture);
@@ -70,7 +77,17 @@ const server = createServer((request, response) => {
   }
   if (request.url.startsWith("/another-page")) {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    response.end("<!doctype html><title>Another page</title><h1>Another page</h1><img src='/assets/a.png' alt=''>");
+    // Links onward, so a depth-2 save has three pages. The badge only *rests* at
+    // N while page N+1 is being fetched, so a two-page save shows "2" for barely
+    // an instant and a third page is what makes the count observable at all.
+    response.end("<!doctype html><title>Another page</title><h1>Another page</h1>"
+      + "<img src='/assets/a.png' alt=''><a href='/third-page'>onward</a>");
+    return;
+  }
+  if (request.url.startsWith("/third-page")) {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end("<!doctype html><title>Third page</title><h1>Third page</h1>"
+      + "<img src='/assets/b.png' alt=''><img src='/assets/c.png' alt=''><img src='/assets/d.png' alt=''>");
     return;
   }
   if (request.url.endsWith(".css")) {
@@ -101,9 +118,11 @@ const context = await chromium.launchPersistentContext(profile, {
 });
 
 let extensionId = null;
+let serviceWorker = null;
 await check("dist/ loads as an unpacked extension and its service worker registers", async () => {
   const worker = context.serviceWorkers()[0]
     || await context.waitForEvent("serviceworker", { timeout: 30000 });
+  serviceWorker = worker;
   extensionId = worker.url().split("/")[2];
   assert.match(worker.url(), /background\.js$/);
   // If the worker threw while evaluating its imports it would not answer.
@@ -145,9 +164,18 @@ await check("the reader's modules parse and it reports its own empty state", asy
  * Save a page, then read it with the network watched
  * ------------------------------------------------------------------ */
 
+/** The toolbar badge as the user would see it: text and background colour. */
+const readBadge = () => serviceWorker.evaluate(async () => ({
+  text: await chrome.action.getBadgeText({}),
+  color: await chrome.action.getBadgeBackgroundColor({}),
+}));
+const badgeSamples = [];
+
 await check("a page saved through the extension reads back with no network request", async () => {
   const tab = await context.newPage();
   await tab.goto(`${origin}/torture`, { waitUntil: "load" });
+  // From here the site answers slowly, so the badge has states to observe.
+  responseDelayMs = 120;
 
   // An extension page is the only place `chrome.runtime.sendMessage` reaches the
   // worker, so the save is started the same way the popup starts it.
@@ -162,21 +190,37 @@ await check("a page saved through the extension reads back with no network reque
       tabId: target.id,
       pageUrl: target.url,
       pageTitle: target.title,
-      // Depth 1 so a followed link goes through `extractAndTokenizeResources`,
-      // which is the path that used to keep live references.
-      depth: 1,
+      // Depth 2 so followed links go through `extractAndTokenizeResources`, the
+      // path that used to keep live references, and so the badge has a middle
+      // state to be observed in.
+      depth: 2,
     });
   }, [origin]);
   assert.ok(started?.accepted, `the save was refused: ${JSON.stringify(started)}`);
 
+  /* Sampled while the save runs, so the badge is seen in the state a user with
+     the popup closed would see it in.
+
+     The loop waits for the pack *and* for the badge to clear. The pack lands in
+     storage before `runCapture` finishes its teardown, so stopping at the pack
+     alone opened the reader mid-teardown — which was a real, reproducible flake
+     that made the saved page render empty. */
   let pack = null;
-  for (let attempt = 0; attempt < 90 && !pack; attempt += 1) {
-    await driver.waitForTimeout(1000);
-    const library = await driver.evaluate(() => chrome.runtime.sendMessage({ type: "LIST_LIBRARY" }));
-    pack = (library?.packs || [])[0] || null;
+  let settled = false;
+  for (let attempt = 0; attempt < 1500 && !settled; attempt += 1) {
+    await driver.waitForTimeout(60);
+    const badge = await readBadge();
+    badgeSamples.push(badge);
+    if (!pack || attempt % 5 === 0) {
+      const library = await driver.evaluate(() => chrome.runtime.sendMessage({ type: "LIST_LIBRARY" }));
+      pack = (library?.packs || [])[0] || pack;
+    }
+    settled = Boolean(pack) && badge.text === "";
   }
   assert.ok(pack, "the save never produced a pack");
-  assert.ok(pack.stats.pages >= 2, `expected the followed link to be saved too, got ${pack.stats.pages} page(s)`);
+  assert.ok(pack.stats.pages >= 3, `expected the followed links to be saved too, got ${pack.stats.pages} page(s)`);
+
+  responseDelayMs = 0;
 
   // Everything from here is the read. Nothing may leave the extension.
   siteHits.length = 0;
@@ -215,6 +259,67 @@ await check("a page saved through the extension reads back with no network reque
     return storage.findSavedUrl(url);
   }, `${origin}/torture`);
   assert.equal(stillFound, null, "a deleted pack is still reachable through the saved-URL index");
+});
+
+/* ------------------------------------------------------------------ *
+ * The toolbar badge
+ * ------------------------------------------------------------------ */
+
+// #0a84ff, the save colour. Journey mode uses #b85c5c so the two modes stay
+// tellable apart by colour, which is the only thing legible at badge size.
+const SAVE_BLUE = [10, 132, 255, 255];
+
+await check("a link-following save counts pages on the badge, in the save colour", async () => {
+  const texts = badgeSamples.map((sample) => sample.text);
+  const counted = badgeSamples.filter((sample) => /^\d+$/.test(sample.text));
+  assert.ok(
+    counted.length > 0,
+    `the badge never showed a page count during a depth-1 save. Saw: ${JSON.stringify([...new Set(texts)])}`,
+  );
+  // Only ever pages already saved, so it climbs and never reports work remaining.
+  const numbers = counted.map((sample) => Number(sample.text));
+  assert.deepEqual(numbers, [...numbers].sort((a, b) => a - b), `the count went backwards: ${numbers.join(",")}`);
+  assert.ok(Math.max(...numbers) >= 2, `the count never got past 1, so it is not really counting: saw ${numbers.join(",")}`);
+  assert.deepEqual(counted[0].color, SAVE_BLUE, "the counting badge is not the save colour");
+  // A dot first, before any page has landed.
+  assert.ok(texts.includes("•"), "the badge never showed the working dot before the first page landed");
+  // And it clears when the save is done.
+  assert.equal((await readBadge()).text, "", "the badge was left showing something after the save finished");
+});
+
+/* This checks that a single-page save shows the dot and finishes cleanly. It does
+   NOT check that such a save never shows a count: `pages` reaches 1 only after
+   the last asset lands and the badge clears a few milliseconds later, so a build
+   that wrongly counted here looked identical to one that did not — measured, by
+   mutating the rule and watching this pass anyway. That rule is decided in
+   `captureBadgeText` and checked in `tests/badge.test.mjs`. */
+await check("a single-page save shows the working dot and clears", async () => {
+  responseDelayMs = 120;
+  const tab = await context.newPage();
+  await tab.goto(`${origin}/another-page`, { waitUntil: "load" });
+  const driver = await context.newPage();
+  await driver.goto(`chrome-extension://${extensionId}/viewer.html`);
+  await driver.evaluate(async ([siteOrigin]) => {
+    const tabs = await chrome.tabs.query({});
+    const target = tabs.find((candidate) => candidate.url && candidate.url.includes("/another-page"));
+    return chrome.runtime.sendMessage({
+      type: "START_CAPTURE",
+      tabId: target.id,
+      pageUrl: target.url,
+      pageTitle: target.title,
+      depth: 0,
+    });
+  }, [origin]);
+
+  const seen = [];
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    await driver.waitForTimeout(50);
+    const badge = await readBadge();
+    seen.push(badge.text);
+    if (badge.text === "" && seen.some((text) => text === "•")) break;
+  }
+  assert.ok(seen.includes("•"), `a single-page save should show the working dot. Saw: ${JSON.stringify([...new Set(seen)])}`);
+  assert.equal(seen[seen.length - 1], "", "the badge was left set after a single-page save finished");
 });
 
 await context.close();

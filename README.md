@@ -164,7 +164,19 @@ See `STORE_LISTING.md` for ready-to-paste listing copy, permission justification
 
 **Save as I browse** starts a collection instead: PagePack saves the starting page, follows navigation in that tab, automatically includes child tabs opened from it, and keeps a resumable draft. Unrelated tabs stay outside it. When you come back to the popup you see what was collected, including anything that failed, and you choose which pages to keep. The result is one saved item that remembers how its pages link to each other. Collections use the same *Keep scripts* setting; linked-page depth does not apply to them.
 
-While either is running, the toolbar icon carries a badge, so progress is visible after the popup closes.
+While either is running, the toolbar icon carries a badge, so progress is visible
+after the popup closes. Colour tells the two modes apart, because at badge size a
+colour is legible at a glance and a glyph is not:
+
+| | Badge | Meaning |
+| --- | --- | --- |
+| **Save page**, single page | Blue dot | Working. There is no page count worth showing. |
+| **Save page**, linked pages | Blue number | Pages saved so far. It only goes up. |
+| **Save as I browse** | Red number | Pages collected so far. |
+
+The number on a link-following save is what distinguishes a save that is working
+from one that is stuck, which a static dot cannot. It counts pages already saved,
+never work remaining, and caps at `99+`.
 
 ### Reader
 
