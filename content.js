@@ -23,10 +23,25 @@ function replaceCssUrls(cssText, collect, baseUrl) {
     const token = collect(value.trim(), "style", baseUrl);
     return token ? full.replace(value, token) : full;
   });
-  return withImports.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (full, quote, value) => {
+  const withUrls = withImports.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (full, quote, value) => {
     if (/^(data|blob):/i.test(value) || value.startsWith("#")) return full;
     const token = collect(value.trim(), "asset", baseUrl);
     return token ? `url(${token})` : full;
+  });
+  // The bare-string form of `image-set()` — `image-set("a.png" 1x)` — carries a
+  // URL with no `url()` around it, so the pass above walks straight past it. It
+  // runs after that pass, never before, or it would re-quote a token that the
+  // `url()` rewriting had already produced. Mirrors `rewriteImageSet` in
+  // `url-surface.js`; the service worker imports that copy, an injected script
+  // cannot import anything, and `tests/offline-guarantee.test.mjs` renders a page
+  // through this file in a real browser so the two cannot quietly disagree.
+  return withUrls.replace(/((?:-webkit-)?image-set\()([^)]*(?:\([^)]*\)[^)]*)*)(\))/gi, (full, open, body, close) => {
+    const rewritten = body.replace(/(["'])([^"']+)\1/g, (quoted, quote, value) => {
+      if (/^(data|blob):/i.test(value) || value.startsWith("#") || /^__PAGEPACK_RESOURCE_\d+__$/.test(value)) return quoted;
+      const token = collect(value.trim(), "asset", baseUrl);
+      return token ? `${quote}${token}${quote}` : quoted;
+    });
+    return `${open}${rewritten}${close}`;
   });
 }
 
@@ -99,7 +114,21 @@ function prepareDocument(options) {
     return token;
   };
 
-  clone.querySelectorAll("noscript, base, iframe, frame, meta[http-equiv='Content-Security-Policy' i]").forEach((node) => node.remove());
+  // Everything that embeds a document or navigates away. Kept in step with
+  // `NETWORK_ELEMENTS` in `url-surface.js`, which is what the service worker's
+  // fetched-page path strips and what the offline audit checks for.
+  //
+  // `meta[http-equiv=refresh]` is the important one and the reason this list is
+  // not just about tidiness: every other construct here loads a subresource, and
+  // a subresource is refused by the reader's content-security policy even if
+  // capture misses it. A refresh *navigates*, and no CSP directive in any
+  // shipping browser stops a sandboxed frame navigating itself. If one survives
+  // capture, opening the save walks the reader onto the live page.
+  clone.querySelectorAll([
+    "noscript", "base", "iframe", "frame", "frameset", "portal", "object", "embed", "applet",
+    "meta[http-equiv='Content-Security-Policy' i]",
+    "meta[http-equiv='refresh' i]",
+  ].join(", ")).forEach((node) => node.remove());
   if (!options.runScripts) {
     clone.querySelectorAll("script").forEach((node) => node.remove());
     clone.querySelectorAll("*").forEach((node) => [...node.attributes].forEach((attribute) => {
@@ -148,11 +177,45 @@ function prepareDocument(options) {
     if (sourceToken) node.setAttribute("src", sourceToken);
     if (posterToken) node.setAttribute("poster", posterToken);
   });
-  clone.querySelectorAll("object[data], embed[src]").forEach((node) => {
-    const attribute = node.hasAttribute("data") ? "data" : "src";
-    const token = options.captureMedia ? collect(node.getAttribute(attribute), "media") : null;
-    if (token) node.setAttribute(attribute, token);
-    else node.removeAttribute(attribute);
+  // `<object>` and `<embed>` used to be saved as media here. They are removed
+  // above instead, because the reader refuses them outright — `object-src 'none'`
+  // — so a saved copy of their bytes could never be shown and only inflated the
+  // pack. The README says so under Important limits.
+  clone.querySelectorAll("track[src]").forEach((node) => {
+    // Captions are small and are the one part of a video that still works when
+    // the media itself was skipped, so they are saved either way.
+    const token = collect(node.getAttribute("src"), "media");
+    if (token) node.setAttribute("src", token);
+    else node.removeAttribute("src");
+  });
+  // An SVG <image> or <use> addresses its target with `href`, and with
+  // `xlink:href` on anything authored before SVG 2. Both still fetch, and both
+  // used to be left pointing at the network.
+  clone.querySelectorAll("image, use").forEach((node) => {
+    for (const attribute of ["href", "xlink:href"]) {
+      const value = node.getAttribute(attribute);
+      if (value === null) continue;
+      // A same-document fragment reaches nothing and is usually load-bearing —
+      // `<use href="#icon">` is the common case — so it stays as it is.
+      if (value.trim().startsWith("#")) continue;
+      // A <use> pointing into another document is dropped rather than saved:
+      // browsers refuse a cross-document <use> target and a data: URL is
+      // cross-document, so the bytes could never render. See `classifyResource`
+      // in `background.js`, which makes the same call for a fetched page.
+      if (node.localName === "use") {
+        node.removeAttribute(attribute);
+        continue;
+      }
+      const token = collect(value, "image");
+      if (token) node.setAttribute(attribute, token);
+      else node.removeAttribute(attribute);
+    }
+  });
+  // The obsolete `background` attribute still loads in every current browser.
+  clone.querySelectorAll("[background]").forEach((node) => {
+    const token = collect(node.getAttribute("background"), "image");
+    if (token) node.setAttribute("background", token);
+    else node.removeAttribute("background");
   });
   clone.querySelectorAll("[style]").forEach((node) => node.setAttribute("style", replaceCssUrls(node.getAttribute("style"), collect, pageUrl)));
   clone.querySelectorAll("style").forEach((node) => { node.textContent = replaceCssUrls(node.textContent, collect, pageUrl); });

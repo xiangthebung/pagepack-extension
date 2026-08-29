@@ -50,8 +50,15 @@ import {
   pendingJourneyItems,
   removeJourneyItem,
 } from "./journey-queue.js";
+import { rewriteImageSet, stripNetworkElements } from "./url-surface.js";
 
 const MAX_RESOURCE_BYTES = 128 * 1024 * 1024;
+// A host that accepts a connection and then never answers used to stall a whole
+// save: child pages are fetched one after another, so one unresponsive server
+// held the queue open with the badge still lit and no way out but cancelling.
+// Treat silence as a failed resource, which the pack already knows how to
+// report and retry.
+const FETCH_TIMEOUT_MS = 30000;
 // Same-site link following. Beyond three levels the per-pack page cap is always
 // reached first, so a deeper setting only promises something it cannot keep.
 const MAX_CAPTURE_DEPTH = 3;
@@ -145,6 +152,14 @@ function captureErrorMessage(error) {
   if (/receiving end does not exist|message port closed|page closed before capture/i.test(message)) {
     return "The page changed before the save finished. Open it again and retry.";
   }
+  /* Running out of room. IndexedDB reports this as a `QuotaExceededError`, or on
+     some platforms as a plain abort naming the backing store, and the raw text is
+     Chrome's own — "Encountered full disk while opening backing store for
+     indexedDB.open" was what the popup used to print. It says nothing a person can
+     act on, so it is replaced with the one thing they can do. */
+  if (error?.name === "QuotaExceededError" || /quota|full disk|storage transaction was aborted/i.test(message)) {
+    return "There is not enough room left to store this save. Delete a few saved pages, or free up disk space, and try again.";
+  }
   return message;
 }
 
@@ -226,13 +241,41 @@ function makeToken(index) {
   return `__PAGEPACK_RESOURCE_${index}__`;
 }
 
+/**
+ * What a URL-bearing attribute should become in the saved copy.
+ *
+ * Returns the resource kind to save it as, `"drop"` to delete the attribute, or
+ * `null` to leave it alone. `"drop"` earns its place: leaving a remote address on
+ * an element whose content is not in the pack is never right, and returning
+ * `null` for that case used to keep a live `<video src>` in a saved page whenever
+ * media capture was off — exactly the reference the reader must not hold.
+ *
+ * The complete list of attributes that load something is in `url-surface.js`, and
+ * `tests/offline-guarantee.test.mjs` fails if this function stops covering one.
+ */
 function classifyResource(tagName, attrName, tagText, options) {
   const tag = tagName.toLowerCase();
   const attr = attrName.toLowerCase();
-  if (tag === "script" && attr === "src") return options.runScripts ? "script" : null;
-  if (tag === "link" && attr === "href" && /rel\s*=\s*["'][^"']*stylesheet/i.test(tagText)) return "style";
+  if (tag === "script" && attr === "src") return options.runScripts ? "script" : "drop";
+  if (tag === "link" && attr === "href") {
+    return /rel\s*=\s*["'][^"']*stylesheet/i.test(tagText) ? "style" : "drop";
+  }
+  // An SVG <image> or <use> addresses its target with `href`, and with
+  // `xlink:href` on anything authored before SVG 2. Both still fetch.
+  if (tag === "image" && (attr === "href" || attr === "xlink:href")) return "image";
+  // A <use> pointing into another document is dropped rather than saved. Browsers
+  // refuse a cross-document <use> target and a data: URL is cross-document, so the
+  // bytes could never render — saving them would only inflate the pack while
+  // leaving the sprite blank either way. A same-document `#id` reference works
+  // offline and is preserved by the fragment check at the call site.
+  if (tag === "use" && (attr === "href" || attr === "xlink:href")) return "drop";
+  // <input type="image"> is a submit button that loads a picture like an <img>.
+  if (tag === "input" && attr === "src") return /type\s*=\s*["']?image/i.test(tagText) ? "image" : "drop";
+  // The obsolete `background` attribute still loads in every current browser.
+  if (["body", "table", "td", "th"].includes(tag) && attr === "background") return "image";
   if (["img", "source", "video", "audio", "track"].includes(tag) && ["src", "poster"].includes(attr)) {
-    return options.captureMedia || ["img", "source"].includes(tag) ? "media" : null;
+    if (["img", "source"].includes(tag)) return "media";
+    return options.captureMedia ? "media" : "drop";
   }
   return null;
 }
@@ -288,11 +331,16 @@ function tokenizeCss(cssText, pageUrl, registerResource) {
     const token = registerResource(value.trim(), "style", pageUrl);
     return token ? full.replace(value, token) : full;
   });
-  return withImports.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (full, quote, value) => {
+  const withUrls = withImports.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (full, quote, value) => {
     if (/^(data|blob):/i.test(value) || value.startsWith("#")) return full;
     const token = registerResource(value.trim(), "asset", pageUrl);
     return token ? `url(${token})` : full;
   });
+  // After the `url()` pass, so a `url()` nested inside an `image-set()` is already
+  // a bare token by the time this runs. What is left is the bare-string form —
+  // `image-set("a.png" 1x)` — which carries a URL with no `url()` around it, and
+  // so walked straight past a rewriter that only looked for `url(`.
+  return rewriteImageSet(withUrls, registerResource, pageUrl);
 }
 
 // Exported for `tests/srcset.test.mjs`, which reads a fetched page through this
@@ -320,15 +368,25 @@ export function extractAndTokenizeResources(html, pageUrl, options) {
     return token;
   };
   const tagPattern = /<([a-z][\w:-]*)\b[^>]*>/gi;
-  let result = String(html || "").replace(tagPattern, (tagText, tagName) => {
+  // Elements that embed or navigate go first, before any attribute is looked at.
+  // A page fetched as a followed link used to keep its `<iframe>`, its `<object>`,
+  // its `<base>` and — worst — its `<meta http-equiv="refresh">`. That last one is
+  // the only construct in a saved page that no content-security policy can stop,
+  // because it navigates rather than loads: opening such a save moved the reader
+  // onto the live site. The live-tab path in `content.js` had removed frames all
+  // along; this path never did, and the README claimed it for both.
+  let result = stripNetworkElements(String(html || "")).replace(tagPattern, (tagText, tagName) => {
     const tag = tagName.toLowerCase();
-    if (["a", "base", "meta", "form"].includes(tag)) return tagText;
+    if (["a", "meta", "form"].includes(tag)) return tagText;
     if (tag === "link" && !/rel\s*=\s*["'][^"']*stylesheet/i.test(tagText)) return "";
     // Global. Without the `g` this rewrote the first of `src`, `href` and `poster`
     // on a tag and stopped, so `<video src poster>` kept a remote poster and the
     // reader drew a broken frame offline for exactly the markup a video needs.
-    const rewritten = tagText.replace(/\s(src|href|poster)\s*=\s*(["'])(.*?)\2/gi, (whole, attrName, quote, rawUrl) => {
+    const rewritten = tagText.replace(/\s(src|href|poster|xlink:href|background)\s*=\s*(["'])(.*?)\2/gi, (whole, attrName, quote, rawUrl) => {
       const kind = classifyResource(tagName, attrName, tagText, options);
+      // A same-document fragment reaches nothing and is often load-bearing —
+      // `<use href="#icon">` is the common case — so it is never dropped.
+      if (kind === "drop") return String(rawUrl).trim().startsWith("#") ? whole : "";
       const token = kind ? registerResource(rawUrl, kind, pageUrl) : null;
       if (!token) return whole;
       return ` ${attrName}=${quote}${token}${quote}`;
@@ -341,7 +399,8 @@ export function extractAndTokenizeResources(html, pageUrl, options) {
     // element's own `src`, so the candidate that repeats the `src` — which is most
     // responsive markup — is one resource rather than a second copy of the same
     // bytes in the pack.
-    const candidateKind = classifyResource(tag, "src", tagText, options) || "image";
+    const classified = classifyResource(tag, "src", tagText, options);
+    const candidateKind = classified && classified !== "drop" ? classified : "image";
     const collectCandidate = (value, _kind, baseUrl) => registerResource(value, candidateKind, baseUrl);
     return rewritten.replace(/\ssrcset\s*=\s*(["'])([\s\S]*?)\1/i, (whole, quote, rawValue) =>
       ` srcset=${quote}${rewriteSrcset(rawValue, collectCandidate, pageUrl)}${quote}`);
@@ -378,12 +437,31 @@ function textFromDataUrl(value) {
   }
 }
 
+/**
+ * `fetch` with a deadline, on top of whatever cancel signal the caller already has.
+ *
+ * A timeout is reported as an ordinary failure, never as an abort. The cancel
+ * paths key off the capture's own signal, and a slow host surfacing as a
+ * cancellation would throw away every page saved so far — so the two have to stay
+ * distinguishable even though both arrive as an `AbortError`.
+ */
+function fetchWithTimeout(url, init = {}) {
+  const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+  const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+  return fetch(url, { ...init, signal }).catch((error) => {
+    if (timeout.aborted && !init.signal?.aborted) {
+      throw new Error(`no response after ${Math.round(FETCH_TIMEOUT_MS / 1000)}s`);
+    }
+    throw error;
+  });
+}
+
 async function fetchResource(resource, resourceCache, visiting = new Set(), signal) {
   const cacheKey = `${resource.kind}:${resource.url}`;
   if (resourceCache.has(cacheKey)) return resourceCache.get(cacheKey);
   if (visiting.has(cacheKey)) throw new Error("cyclic resource reference");
   visiting.add(cacheKey);
-  const response = await fetch(resource.url, { credentials: "include", redirect: "follow", signal });
+  const response = await fetchWithTimeout(resource.url, { credentials: "include", redirect: "follow", signal });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const contentLength = Number(response.headers.get("content-length") || 0);
   if (contentLength > MAX_RESOURCE_BYTES) throw new Error("resource is too large");
@@ -542,9 +620,20 @@ async function hydrateResources(page, resourceCache, options, onProgress) {
       } catch (error) {
         if (options.signal?.aborted || isCaptureCancelled(options.requestId)) throw new CaptureCancelledError();
         failures.push({ url: resource.url, kind: resource.kind, message: error.message });
-        // Keep the original URL as a recoverable fallback if the resource is
-        // unavailable during this save.
-        page.resourceMap[resource.token] = resource.url;
+        /* A resource that could not be fetched resolves to nothing.
+
+           It used to resolve to its original address, described as a recoverable
+           fallback, which put a live URL inside the saved page: every failed
+           image left the pack holding a reference to the network, on the one
+           screen that promises it holds none. The fallback could not work in any
+           case — the reader refuses a remote image under `img-src 'self' data:
+           blob:`, so it never loaded, it only made the claim untrue.
+
+           Nothing is lost by dropping it. Retry finds the resource through the
+           `failures` entry recorded just above and the page's own `resources`
+           list — see `retryPackResourceIssue` in `retry.js` — not through this
+           map. */
+        page.resourceMap[resource.token] = "";
       }
       completed += 1;
       onProgress?.(completed, resources.length);
@@ -554,12 +643,56 @@ async function hydrateResources(page, resourceCache, options, onProgress) {
   return { bytes: totalBytes, failures };
 }
 
-function siteKey(hostname) {
+/**
+ * Suffixes under which each subdomain is a different owner's site.
+ *
+ * Two groups, both serving the same purpose. The first is registry suffixes where
+ * registrations happen at the third level. The second is hosting platforms, and
+ * that group is the one with teeth: without it every GitHub Pages site keyed to
+ * `github.io`, so following links from one person's site walked into other
+ * people's — a save that quietly collected pages the user never asked for, from
+ * sites they had never visited.
+ *
+ * This is a curated subset of the Public Suffix List, not the list itself. The
+ * full list is around 200 kB and changes weekly, which is a poor trade for a
+ * check whose only job is to decide when to stop crawling: being wrong costs an
+ * unfollowed link or an extra subdomain, not a broken save. Add entries when a
+ * real site is misjudged.
+ */
+const MULTI_LABEL_SUFFIXES = new Set([
+  // Registry suffixes with third-level registration.
+  "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk", "sch.uk",
+  "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+  "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+  "co.nz", "org.nz", "net.nz", "ac.nz", "govt.nz",
+  "co.za", "org.za", "net.za", "web.za",
+  "com.br", "net.br", "org.br", "gov.br",
+  "co.in", "net.in", "org.in", "gen.in", "firm.in",
+  "co.kr", "or.kr", "ne.kr", "go.kr",
+  "com.mx", "org.mx", "gob.mx",
+  "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+  "com.tr", "com.ar", "com.sg", "com.hk", "com.tw", "com.pl", "com.ua", "com.ph", "com.my", "com.vn",
+  // Hosting platforms: one subdomain, one owner.
+  "github.io", "gitlab.io", "blogspot.com", "wordpress.com", "tumblr.com",
+  "vercel.app", "netlify.app", "netlify.com", "herokuapp.com", "web.app",
+  "firebaseapp.com", "pages.dev", "workers.dev", "glitch.me", "surge.sh",
+  "neocities.org", "readthedocs.io", "gitbook.io", "notion.site", "substack.com",
+  "s3.amazonaws.com", "cloudfront.net", "azurewebsites.net", "appspot.com",
+  "myshopify.com", "squarespace.com", "webflow.io", "wixsite.com", "weebly.com",
+  "bandcamp.com", "itch.io", "medium.com",
+]);
+
+// Exported for `tests/crawl-scope.test.mjs`. What counts as "the same site" is
+// what decides when a save stops following links, so it is worth pinning down.
+export function siteKey(hostname) {
   const labels = String(hostname || "").toLowerCase().split(".").filter(Boolean);
   if (labels.length <= 2) return labels.join(".");
+  // The longest matching suffix wins, so a three-label entry has to be tried
+  // before the two-label one: `bucket.s3.amazonaws.com` is its own site, and
+  // testing `amazonaws.com` first would never reach that conclusion.
+  if (labels.length >= 4 && MULTI_LABEL_SUFFIXES.has(labels.slice(-3).join("."))) return labels.slice(-4).join(".");
   const suffix = labels.slice(-2).join(".");
-  const commonSecondLevelSuffixes = new Set(["co.uk", "org.uk", "ac.uk", "com.au", "net.au", "co.jp", "co.nz"]);
-  return commonSecondLevelSuffixes.has(suffix) ? labels.slice(-3).join(".") : suffix;
+  return MULTI_LABEL_SUFFIXES.has(suffix) ? labels.slice(-3).join(".") : suffix;
 }
 
 function isLinkInScope(url, pageUrl) {
@@ -568,24 +701,37 @@ function isLinkInScope(url, pageUrl) {
   return siteKey(target.hostname) === siteKey(source.hostname);
 }
 
+/**
+ * In-scope links on a page, up to `MAX_LINKS_PER_PAGE`.
+ *
+ * Returns `{ links, truncated }`. `truncated` used to be nothing at all: a page
+ * with four hundred links had three hundred dropped with no record anywhere, so a
+ * save could silently omit most of a section index and look complete. The count
+ * is reported as an issue by `runCapture` so the user can see it happened.
+ */
 function linksFromMarkup(markup, pageUrl) {
   const links = [];
   const seen = new Set();
   const pattern = /<a\b[^>]*\bhref\s*=\s*(["'])(.*?)\1/gi;
   let match;
-  while ((match = pattern.exec(markup)) && links.length < MAX_LINKS_PER_PAGE) {
+  let truncated = false;
+  while ((match = pattern.exec(markup))) {
+    if (links.length >= MAX_LINKS_PER_PAGE) {
+      truncated = true;
+      break;
+    }
     const url = normalizeUrl(match[2], pageUrl);
     if (!isHttpUrl(url) || seen.has(url)) continue;
     if (!isLinkInScope(url, pageUrl)) continue;
     seen.add(url);
     links.push(url);
   }
-  return links;
+  return { links, truncated };
 }
 
 async function fetchPageSource(url, options) {
   throwIfCaptureCancelled(options.requestId);
-  const response = await fetch(url, { credentials: "include", redirect: "follow", signal: options.signal });
+  const response = await fetchWithTimeout(url, { credentials: "include", redirect: "follow", signal: options.signal });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("html") && !contentType.includes("xhtml")) throw new Error("not an HTML page");
@@ -1170,6 +1316,11 @@ async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, fol
   let totalBytes = 0;
   let processedPages = 0;
   let pageLimitReached = false;
+  let byteLimitReached = false;
+  // Pages whose resources were actually fetched. A page left in the queue when
+  // the size ceiling stopped the run has markup made only of unresolved tokens,
+  // so it must not reach the library.
+  const hydratedPages = new Set();
   const packLimits = normalizePackLimits({ maxPages, maxTotalBytes });
   const capturePageLimit = packLimits.maxPages;
   const rootPage = {
@@ -1179,6 +1330,11 @@ async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, fol
     resources: root.meta.resources || [],
     resourceMap: {},
   };
+  // `captureLivePage` guards this for the live tab; this path did not, and an
+  // address `normalizeUrl` could not parse produced an empty string that reached
+  // `isLinkInScope`, where `new URL("")` threw a bare TypeError and failed the
+  // whole save with a message about an invalid URL.
+  if (!rootPage.url) throw new Error("This page's address could not be read, so it cannot be saved.");
   pages.push(rootPage);
 
   const visited = new Set([rootPage.url]);
@@ -1204,11 +1360,32 @@ async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, fol
     progress.pagesDone = processedPages;
     totalBytes += resourceResult.bytes;
     failures.push(...resourceResult.failures.map((failure) => ({ ...failure, type: "resource", pageUrl: page.url })));
+    hydratedPages.add(page);
+    /* Stop, keep what is already saved, and say so.
+
+       This used to `throw`, which failed the whole capture and wrote nothing: a
+       249-page crawl that crossed the ceiling on page 250 discarded all 249 and
+       told the user only that the save was too large. The page cap immediately
+       below had always degraded gracefully instead. There was no reason for the
+       two ceilings to behave differently, and the destructive one was the
+       surprise. Pages fetched but not yet hydrated are dropped below, because
+       their markup is all unresolved tokens. */
     if (totalBytes > packLimits.maxTotalBytes) {
-      throw new Error(`This save is larger than the ${formatPackSize(packLimits.maxTotalBytes)} pack limit.`);
+      byteLimitReached = true;
+      break;
     }
-    if (current.level >= depth) continue;
-    for (const url of linksFromMarkup(page.html, page.url)) {
+    // Nothing more will be added once the page cap is reached, so there is no
+    // point re-reading the links of every page still in the queue.
+    if (current.level >= depth || pageLimitReached) continue;
+    const pageLinks = linksFromMarkup(page.html, page.url);
+    if (pageLinks.truncated) {
+      failures.push({
+        type: "page-limit",
+        pageUrl: page.url,
+        message: `This page had more than ${MAX_LINKS_PER_PAGE} links, so only the first ${MAX_LINKS_PER_PAGE} were followed.`,
+      });
+    }
+    for (const url of pageLinks.links) {
       throwIfCaptureCancelled(requestId);
       if (visited.has(url)) continue;
       if (pages.length >= capturePageLimit) {
@@ -1235,6 +1412,20 @@ async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, fol
     });
   }
 
+  // A page that was fetched but never hydrated has markup made entirely of
+  // unresolved resource tokens, so it would open blank. Only reachable when the
+  // size ceiling stopped the run early.
+  const droppedPages = pages.length - hydratedPages.size;
+  const savedPages = droppedPages ? pages.filter((page) => hydratedPages.has(page)) : pages;
+  if (byteLimitReached) {
+    failures.push({
+      type: "pack-limit",
+      message: `This save reached PagePack’s ${formatPackSize(packLimits.maxTotalBytes)} size limit, so it stopped early`
+        + `${droppedPages ? ` and left out ${droppedPages} page${droppedPages === 1 ? "" : "s"}` : ""}.`
+        + " The pages already saved were kept. Raise the limit under Options, or save fewer linked pages.",
+    });
+  }
+
   const pack = {
     id: makePackId(),
     rootUrl: rootPage.url,
@@ -1246,17 +1437,18 @@ async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, fol
     sortOrder: -1,
     folderId: folderId || DEFAULT_FOLDER_ID,
     limits: packLimits,
-    pages,
+    pages: savedPages,
     failures,
-    stats: { pages: pages.length, bytes: totalBytes, resources: resourceCache.size, failed: failures.length },
+    stats: { pages: savedPages.length, bytes: totalBytes, resources: resourceCache.size, failed: failures.length },
   };
   throwIfCaptureCancelled(requestId);
   progress.phase = "finishing";
-  progress.pagesTotal = pages.length;
+  progress.pagesTotal = savedPages.length;
   await publishProgress(true);
   await putPack(pack);
   job.committed = true;
-  if (countAgainstQuota) await consumeFreePages(pages.length).catch(() => {});
+  // The allowance is charged for what was kept, not for what was fetched.
+  if (countAgainstQuota) await consumeFreePages(savedPages.length).catch(() => {});
   await deleteCapture(requestId).catch(() => {});
   // Keep completion messages small. The popup reloads the compact library
   // index instead of receiving the captured HTML through the message bus.

@@ -205,14 +205,22 @@ assert.deepEqual(everything.resources.map((resource) => resource.url), [
 ]);
 assert.equal(/https?:\/\//.test(everything.html), false);
 
-// With media capture off a video keeps neither attribute, so switching it off
-// cannot leave half a remote video behind.
+/* With media capture off a video keeps neither attribute, so switching it off
+   cannot leave half a remote video behind.
+
+   This block used to assert the opposite of the sentence above it: that both
+   attributes survived with their original remote addresses. They did, and that
+   was the bug — a save made with media capture off carried a live `<video src>`
+   into the pack, so the reader held a reference to the network on a page the user
+   had been told was entirely on their device. `classifyResource` now answers
+   `"drop"` for a media attribute it will not save, and the attribute is deleted. */
 const noMedia = tokenize('<video src="/media/clip.mp4" poster="/img/poster.png"></video>', {
   captureMedia: false,
 });
 assert.deepEqual(noMedia.resources, []);
-assert.match(noMedia.html, /src="\/media\/clip\.mp4"/);
-assert.match(noMedia.html, /poster="\/img\/poster\.png"/);
+assert.equal(/\/media\/clip\.mp4/.test(noMedia.html), false);
+assert.equal(/\/img\/poster\.png/.test(noMedia.html), false);
+assert.equal(noMedia.html, "<video></video>");
 
 /* ------------------------------------------------------------------ *
  * A placeholder is not a resource

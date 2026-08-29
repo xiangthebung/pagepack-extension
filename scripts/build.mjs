@@ -63,6 +63,7 @@ const RUNTIME_FILES = [
   'sandbox.js',
 
   // Shared modules.
+  'url-surface.js',
   'storage.js',
   'monetization.js',
   'pricing.js',

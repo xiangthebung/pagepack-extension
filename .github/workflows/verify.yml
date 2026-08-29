@@ -20,6 +20,11 @@ jobs:
 
       - run: npm ci
 
+      # `tests/offline-network.test.mjs` measures the offline guarantee in a real
+      # browser rather than inferring it from the saved markup, so the suite needs
+      # a Chromium. Only Chromium is installed; nothing here is cross-browser.
+      - run: npx playwright install --with-deps chromium
+
       - run: npm run verify
 
       - run: npm run zip

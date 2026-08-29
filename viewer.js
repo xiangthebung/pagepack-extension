@@ -1,9 +1,16 @@
 import { findSavedUrl, getPack } from "./storage.js";
+import { stripNetworkElements } from "./url-surface.js";
 
 const $ = (selector) => document.querySelector(selector);
 const CHUNK_SIZE = 4 * 1024 * 1024;
 const RENDER_TIMEOUT = 3500;
-const FRAME_SANDBOX = "allow-forms allow-popups allow-popups-to-escape-sandbox allow-scripts";
+/* No `allow-popups`.
+   A saved page's own scripts could call `window.open("https://…")` and, with
+   `allow-popups-to-escape-sandbox`, land the user on the live site in a new tab
+   — a network request the reader never sanctioned. Nothing in the reader needs
+   popups: "Open online" runs in this document via `chrome.tabs.create`, not in
+   the frame. */
+const FRAME_SANDBOX = "allow-forms allow-scripts";
 const LEGEND_TIMEOUT = 7000;
 
 let pack = null;
@@ -63,10 +70,6 @@ function currentPage() {
 /* ------------------------------------------------------------------ *
  * Markup preparation
  * ------------------------------------------------------------------ */
-
-function escapeAttribute(value) {
-  return String(value || "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-}
 
 function resourceMapFor(page) {
   if (page.resourceMap && typeof page.resourceMap === "object") return page.resourceMap;
@@ -145,8 +148,23 @@ function hydrateMarkup(page, { runScripts = true } = {}) {
     markup = markup.split(token).join(dataUrl || "");
   }
   if (!runScripts) markup = stripUnresolvedStylesheets(markup);
+  // Packs saved before the capture paths learned to remove these still contain
+  // them, and a `<meta http-equiv="refresh">` in an old pack would navigate this
+  // frame onto the live site the moment it opened. The reader cannot re-capture
+  // an old pack, so it strips them at read time instead.
+  markup = stripNetworkElements(markup);
   markup = annotateSavedLinks(markup, page.url);
-  const head = `<base href="${escapeAttribute(page.url)}">${savedLinkStyle()}`;
+  /* No `<base>`.
+     The reader used to inject `<base href="<the original page URL>">` so that
+     relative links resolved. It also silently re-pointed every relative URL that
+     capture had missed at the live origin, which turned a cosmetic gap into a
+     network request — the one thing a saved page must never make. Without it, a
+     missed relative URL resolves against the sandbox's own opaque origin and
+     fails locally, which is the correct way for a capture bug to show up.
+     Link resolution does not need the document base: the page URL is handed to
+     the bridge below as a literal, and `annotateSavedLinks` already resolves
+     against it explicitly. */
+  const head = savedLinkStyle();
   const storageShield = `<script>(function(){
     function memoryStorage(){
       var values = Object.create(null);
@@ -158,16 +176,25 @@ function hydrateMarkup(page, { runScripts = true } = {}) {
   const prelude = `${head}${runScripts ? storageShield : ""}`;
   if (/<head\b[^>]*>/i.test(markup)) markup = markup.replace(/<head\b[^>]*>/i, (match) => `${match}${prelude}`);
   else markup = `${prelude}${markup}`;
+  // The page's own address, for resolving relative links now that no `<base>` is
+  // injected. JSON-encoded so a URL containing a quote cannot end the string.
   const bridge = `<script>(function(){
+    var PAGE_URL = ${JSON.stringify(String(page.url || ""))};
     document.addEventListener('click', function(event){
       if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
       var target = event.target && event.target.nodeType === 1 ? event.target : event.target && event.target.parentElement;
       var link = target && target.closest ? target.closest('a[href]') : null;
-      if (!link || link.target === '_blank') return;
+      // `target="_blank"` is intercepted too. It used to be waved through, so a
+      // link the save did not include opened the live page with no warning,
+      // instead of the "that page isn't in this save" notice every other link
+      // gets. The reader decides what opens online; the saved page does not.
+      if (!link) return;
       var href = link.getAttribute('href');
       if (!href || href.charAt(0) === '#') return;
       event.preventDefault();
-      parent.postMessage({source:'pagepack-saved-page', type:'link', href:new URL(href, document.baseURI).href}, '*');
+      try {
+        parent.postMessage({source:'pagepack-saved-page', type:'link', href:new URL(href, PAGE_URL).href}, '*');
+      } catch (_) {}
     }, true);
     document.addEventListener('submit', function(event){
       var form = event.target;

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Every way a page can reach the network</title>
+
+<!-- One fixture, two readers. `tests/offline-guarantee.test.mjs` runs it through
+     the fetched-page tokeniser and audits the result; `tests/offline-network.test.mjs`
+     loads it in real Chromium, captures it the way the live tab is captured, and
+     counts the requests the reader makes. Every URL below is either relative — so
+     it resolves to whichever origin serves this file — or absolute to a second
+     origin. Neither may receive a single request once the page is saved.
+
+     A construct added here must be handled by both capture paths or the audit
+     fails, which is the point: this file is the checklist. -->
+
+<base href="/base-should-be-removed/">
+<meta http-equiv="refresh" content="9999;url=https://cdn.pagepack-test.invalid/refresh-target">
+<meta http-equiv="Content-Security-Policy" content="default-src *">
+
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/favicon.ico">
+<link rel="preload" as="font" href="/assets/preload.woff2" crossorigin>
+<link rel="manifest" href="/assets/app.webmanifest">
+<link rel="preconnect" href="https://cdn.pagepack-test.invalid">
+
+<style>
+  @import "/assets/imported.css";
+  @import url(/assets/imported-two.css) screen;
+  body { background: url('/assets/bg.png'); color: #222; }
+  @font-face { font-family: Probe; src: url(/assets/probe.woff2) format("woff2"); }
+  .image-set-bare { background-image: image-set("/assets/one.png" 1x, "/assets/two.png" 2x); }
+  .image-set-url { background-image: -webkit-image-set(url("/assets/three.png") 1x); }
+  .cursor { cursor: url(/assets/pointer.cur), auto; }
+  .absolute { background: url(https://cdn.pagepack-test.invalid/absolute.png); }
+</style>
+</head>
+
+<body background="/assets/body-background.png">
+
+<h1>Torture page</h1>
+
+<img src="/assets/plain.png" alt="plain">
+<img src="/assets/responsive.png" srcset="/assets/responsive-2x.png 2x, https://cdn.pagepack-test.invalid/responsive-3x.png 3x" alt="responsive">
+<img src="/assets/lazy-fallback.png" data-src="/assets/lazy.png" data-srcset="/assets/lazy-2x.png 2x" alt="lazy">
+
+<picture>
+  <source media="(min-width: 40em)" srcset="/assets/wide.webp" type="image/webp">
+  <img src="/assets/narrow.png" alt="picture">
+</picture>
+
+<video src="/assets/clip.mp4" poster="/assets/poster.jpg" controls>
+  <source src="/assets/clip.webm" type="video/webm">
+  <track src="/assets/captions.vtt" kind="captions" srclang="en" label="English" default>
+</video>
+
+<audio src="/assets/sound.mp3" controls></audio>
+
+<iframe src="https://cdn.pagepack-test.invalid/embedded-frame" title="frame"></iframe>
+<object data="/assets/document.pdf" type="application/pdf"></object>
+<embed src="/assets/plugin.swf" type="application/x-shockwave-flash">
+
+<form action="https://cdn.pagepack-test.invalid/collect" method="post">
+  <input type="image" src="/assets/submit-button.png" alt="submit">
+  <button type="submit">Send</button>
+</form>
+
+<table background="/assets/table-background.png"><tr><td>cell</td></tr></table>
+
+<svg width="40" height="40" viewBox="0 0 40 40">
+  <defs><symbol id="local-icon"><circle cx="10" cy="10" r="8"/></symbol></defs>
+  <image href="/assets/svg-image.png" width="20" height="20"/>
+  <image xlink:href="/assets/svg-image-legacy.png" width="20" height="20"/>
+  <use href="#local-icon"/>
+  <use href="/assets/sprite.svg#external-icon"/>
+  <use xlink:href="/assets/sprite-legacy.svg#external-icon"/>
+</svg>
+
+<div style="background-image:url(/assets/inline-style.png)">inline style</div>
+<div style="background-image:image-set('/assets/inline-image-set.png' 1x)">inline image-set</div>
+
+<noscript><img src="/assets/noscript-pixel.png" alt=""></noscript>
+
+<a href="/another-page">a link that was saved</a>
+<a href="https://cdn.pagepack-test.invalid/elsewhere" target="_blank">a link that opens in a new tab</a>
+<a href="#local-anchor">a same-page anchor</a>
+
+<script src="/assets/app.js"></script>
+<script>window.__torturePageInlineScriptRan = true;</script>
+</body>
+</html>
