@@ -172,6 +172,14 @@ function runStoreRequest(storeName, mode, operation) {
     const request = operation(transaction.objectStore(storeName));
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
+    /* The transaction can fail without the individual request ever failing, and
+       running out of disk is exactly that case: IndexedDB aborts at commit time.
+       Without this handler the promise simply never settled — `putJourney` is the
+       biggest write in the extension, so a full disk during "Save as I browse"
+       left the queue waiting on a promise that could not resolve, with no error
+       and nothing in the interface to say so. `runTransaction` below always had
+       this; this function did not. */
+    transaction.onabort = () => reject(transaction.error || new Error("Storage transaction was aborted."));
   }));
 }
 
@@ -253,14 +261,31 @@ export function searchPackText(query) {
     .map((pack) => pack.id));
 }
 
+/**
+ * Delete a pack and everything that points at it.
+ *
+ * The `urlIndex` rows are found by walking the store rather than by deriving keys
+ * from `pack.pages`. Deriving them looks simpler and was what this did, but it
+ * only works when the pack is still readable and its page list still matches what
+ * was written: a second delete of the same id — reachable because the library
+ * removes the row optimistically and then reloads — found no pack, quietly skipped
+ * the loop, and left every URL row behind while reporting success. Nothing could
+ * find them afterwards, because the store is keyed by URL and indexed by URL, not
+ * by pack. The symptom was a save that still claimed to exist: "already saved"
+ * kept resolving, and its Open led to a reader page for a pack that was gone.
+ */
 export function deletePack(id) {
-  return getPack(id).then((pack) => runTransaction(["packs", "packIndex", "urlIndex"], "readwrite", (transaction) => {
+  return runTransaction(["packs", "packIndex", "urlIndex"], "readwrite", (transaction) => {
     transaction.objectStore("packs").delete(id);
     transaction.objectStore("packIndex").delete(id);
-    for (const page of pack?.pages || []) {
-      transaction.objectStore("urlIndex").delete(`${canonicalUrl(page.url)}|${id}`);
-    }
-  }));
+    const urlIndex = transaction.objectStore("urlIndex");
+    urlIndex.openCursor().onsuccess = (event) => {
+      const cursor = event.target.result;
+      if (!cursor) return;
+      if (cursor.value?.packId === id) cursor.delete();
+      cursor.continue();
+    };
+  });
 }
 
 export function removePackPage(id, pageIndex) {
