@@ -16,6 +16,7 @@
   --danger: #d70015;
   --danger-soft: rgba(255, 59, 48, .1);
   --focus: rgba(0, 122, 255, .55);
+  --frame-bg: #fff;
   --bar-height: 52px;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
 }
@@ -161,7 +162,7 @@ svg { display: block; fill: none; stroke: currentColor; stroke-linecap: round; s
   width: 100%;
   height: calc(100vh - var(--bar-height));
   border: 0;
-  background: #fff;
+  background: var(--frame-bg);
 }
 
 .reader-toast,
@@ -291,6 +292,7 @@ body:has(.reader-bar:not([hidden])) .reader-message { padding-top: calc(40px + v
     --danger: #ff8078;
     --danger-soft: rgba(255, 69, 58, .16);
     --focus: rgba(108, 182, 255, .7);
+    --frame-bg: #1a1a1c;
   }
   .bar-button-quiet:hover:not(:disabled) { background: #47474d; }
   .loader { box-shadow: none; }
