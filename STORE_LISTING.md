@@ -44,6 +44,22 @@ Some pages cannot be captured completely, including DRM video, live streams, blo
 - **host access to all sites**: Fetches the styles, images, fonts, direct media, and same-site linked pages explicitly requested by the user. Assets can be hosted on domains different from the page itself.
 - **webNavigation**: Watches completed navigation only while a user-requested collection is active, and checks the local URL index when a normal navigation fails offline. Those relationships are stored locally with the collection; navigation data is not transmitted.
 
+## Published policy URLs
+
+Paste these into the Developer Dashboard. They are live now — check them before
+you submit rather than after, because a reviewer following a dead privacy link is
+a rejection, and this collection has already shipped one extension whose in-product
+legal links pointed at a host that did not exist.
+
+```
+Privacy policy   https://personal-website.xiangli3625.workers.dev/legal/pagepack/privacy
+Terms of sale    https://personal-website.xiangli3625.workers.dev/legal/pagepack/terms
+```
+
+The copy in this repository is the original. The portfolio site keeps a vendored
+copy and its test suite diffs the two, so edit the file here and re-copy — never
+the published page on its own.
+
 ## Privacy disclosures for the Developer Dashboard
 
 PagePack handles **website content** and **web history/browsing activity** solely to perform the user-requested capture, saved-link navigation, and offline fallback. It handles a payment account email and subscription state only when a user chooses PagePack Pro. Saved content is stored locally and is not transmitted. Subscription status is exchanged with ExtensionPay; checkout information is handled by ExtensionPay and Stripe.
