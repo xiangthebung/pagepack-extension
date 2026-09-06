@@ -1,12 +1,12 @@
 # PagePack Privacy Policy
 
-Effective: August 29, 2026
+Effective: September 2, 2026
 
 PagePack saves web pages for offline reading. Privacy is part of that purpose: the pages you save and your PagePack library remain on your device.
 
 ## Data PagePack handles
 
-When you click **Save page**, PagePack accesses the current page’s URL, title, visible document content, styles, images, fonts, direct media, and linked same-site pages you asked it to capture. When you start **Save as I browse**, PagePack accesses the pages you visit in the starting tab and child tabs opened from it until you save or discard that collection. PagePack stores that material locally in your browser’s IndexedDB storage. PagePack also stores local preferences, folders, monthly page-allowance usage, and capture status.
+When you click **Save page**, press its keyboard shortcut, choose **Save link with PagePack** on a link, or save the tabs in a window, PagePack accesses the page’s URL, title, visible document content, styles, images, fonts, direct media, site icon, and linked same-site pages you asked it to capture. With linked pages on, PagePack first reads the links on the current page and fetches the linked pages to count them, and shows you the list before anything is saved. When you start **Save as I browse**, PagePack accesses the pages you visit in the starting tab and child tabs opened from it until you save or discard that collection. PagePack stores that material locally in your browser’s IndexedDB storage, together with a small picture of the tab as it was when saved from the popup, the shortcut or a batch. PagePack also stores local preferences, folders, monthly page-allowance usage, capture status, and — for each save — which pages you have opened and how far down each one you were, so the reader can take you back there.
 
 To save a page completely, PagePack requests that page’s images, stylesheets, fonts, and linked pages using your browser’s existing session for that site, exactly as the browser would if you opened them yourself. This is what allows a page you are signed in to to be saved correctly. Those requests go to the site being saved and to no one else, and they stop when the save finishes.
 
@@ -20,7 +20,7 @@ The payment-status cache stored by the extension may include whether Pro is acti
 
 ## Retention and deletion
 
-Saved pages remain until you delete them from the PagePack library or uninstall the extension. Local settings and payment-status data remain until the extension is uninstalled or browser storage is cleared. Data held by ExtensionPay or Stripe is governed by their respective policies and retention requirements.
+Saved pages, their pictures and their reading positions remain until you delete them from the PagePack library or uninstall the extension; deleting a save removes all three. An export you write with **Export as HTML** is an ordinary file on your device, outside PagePack’s control. Local settings and payment-status data remain until the extension is uninstalled or browser storage is cleared. Data held by ExtensionPay or Stripe is governed by their respective policies and retention requirements.
 
 ## Security
 

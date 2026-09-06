@@ -2,9 +2,9 @@
   "manifest_version": 3,
   "name": "PagePack — Offline Web Clipper",
   "short_name": "PagePack",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Save complete web pages to a private, on-device library for reliable offline reading.",
-  "permissions": ["storage", "unlimitedStorage", "scripting", "webNavigation"],
+  "permissions": ["storage", "unlimitedStorage", "scripting", "webNavigation", "contextMenus", "activeTab"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": { "service_worker": "background.js", "type": "module" },
   "incognito": "not_allowed",
@@ -19,7 +19,7 @@
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src http: https:;",
-    "sandbox": "sandbox allow-scripts allow-forms allow-modals; default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' 'unsafe-inline' data:; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data: blob:; connect-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; base-uri 'none'; form-action 'none';"
+    "sandbox": "sandbox allow-scripts allow-forms allow-modals; default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' 'unsafe-inline' data: blob:; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data: blob:; connect-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; base-uri 'none'; form-action 'none';"
   },
   "action": {
     "default_title": "Save this page offline",
@@ -27,6 +27,15 @@
     "default_icon": {
       "16": "icons/icon-16.png",
       "32": "icons/icon-32.png"
+    }
+  },
+  "commands": {
+    "save-page": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S",
+        "mac": "Command+Shift+S"
+      },
+      "description": "Save this page offline"
     }
   }
 }

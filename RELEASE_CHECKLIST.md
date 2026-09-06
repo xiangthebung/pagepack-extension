@@ -1,4 +1,4 @@
-# PagePack 1.0 release checklist
+# PagePack 1.1 release checklist
 
 ## Must complete before submission
 
@@ -11,8 +11,11 @@
 - [ ] Ensure ExtensionPay/Stripe show the PagePack developer as seller and link the hosted terms, refund policy, privacy policy, and support contact.
 - [ ] Test checkout, restore/sign-in, cancellation, failed renewal, the seven-day offline grace period, and a new calendar month.
 - [ ] Test a free linked-page save that exceeds the remaining allowance, confirm the complete interaction is saved, and confirm the next save is blocked.
-- [ ] Confirm the library index rebuilds cleanly on upgrade from a 1.0 profile (IndexedDB version 9) and that existing saves still open.
-- [x] Create an initial 1280×800 Chrome Web Store screenshot and 440×280 promotional tile.
+- [ ] Confirm the library index rebuilds cleanly on upgrade from a 1.0 profile (IndexedDB version 9 → 10, which adds the `reading` and `thumbnails` stores and rebuilds the index without rewriting pack rows) and that existing saves still open. Every existing save shows as unread after the upgrade, by design.
+- [ ] Check `chrome://extensions/shortcuts` in a profile with other extensions: Chrome silently drops the suggested Ctrl+Shift+S if another extension already holds it.
+- [ ] Open a save of 30 MB or more in the reader (`tests/big-pack.test.mjs` does this headless; do it once by hand on a slow machine).
+- [ ] Save a page from the popup, the shortcut, the context menu and “Save all tabs”, then open the library as a page and confirm the pictures, the storage line and the unread dots.
+- [x] Create an initial 1280×800 Chrome Web Store screenshot and 440×280 promotional tile. Regenerated for 1.1 with `node scripts/store-shots.mjs`, which now confirms the pre-flight sheet on the linked save it photographs.
 - [ ] Complete the Developer Dashboard privacy fields using `STORE_LISTING.md` and provide detailed permission justifications.
 - [x] Review the final ZIP to ensure `manifest.json` is at its root and no secrets, test data, or unrelated files are included.
 

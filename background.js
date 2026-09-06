@@ -5,16 +5,20 @@ import {
   deleteJourney,
   deletePack,
   findSavedUrl,
+  findSavedUrls,
   FOLDER_NAME_LIMIT,
   getPack,
   getPackIssues,
   getCapture,
   getJourney,
+  getReadingState,
   getSetting,
+  getThumbnails,
   listCaptures,
   listFolders,
   listJourneySummaries,
   listPacks,
+  listReadingStates,
   makePackId,
   makeFolderId,
   moveAndReorderPack,
@@ -24,6 +28,8 @@ import {
   putJourney,
   putFolder,
   putPack,
+  putReadingState,
+  putThumbnail,
   renameFolder,
   searchPackText,
   setSetting,
@@ -64,6 +70,25 @@ const FETCH_TIMEOUT_MS = 30000;
 const MAX_CAPTURE_DEPTH = 3;
 const MAX_LINKS_PER_PAGE = 100;
 const RESOURCE_CONCURRENCY = 4;
+/* A site icon is a few kilobytes; anything past this is not one, and it is not
+   worth inflating a pack for. */
+const FAVICON_MAX_BYTES = 64 * 1024;
+/* The picture of the tab the full-page library shows. Sized for a row, and kept
+   in its own store so listing the library never has to read it. */
+const THUMBNAIL_SIZE = { width: 320, height: 200 };
+/* A pre-flight discovery is held for this long so the save that follows can
+   reuse the pages it already fetched. */
+const DISCOVERY_TTL_MS = 10 * 60 * 1000;
+const DISCOVERY_FETCH_TIMEOUT_MS = 10000;
+const DISCOVERY_CONCURRENCY = 4;
+/* When a page's own weight could not be measured, what one of its resources is
+   guessed to cost. Low on purpose: an estimate that says "about" should err
+   towards the number the save will beat. */
+const FALLBACK_RESOURCE_BYTES = 60 * 1024;
+const FALLBACK_PAGE_BYTES = 400 * 1024;
+const CONTEXT_MENU_ID = "pagepack-save-link";
+const SAVE_COMMAND = "save-page";
+const BADGE_ERROR_MS = 6000;
 const CAPTURE_PREFERENCES_KEY = "capture-preferences";
 const DEFAULT_CAPTURE_PREFERENCES = Object.freeze({
   depth: 0,
@@ -75,6 +100,7 @@ const DEFAULT_CAPTURE_PREFERENCES = Object.freeze({
 const captureStreams = new Map();
 const captureJobs = new Map();
 const cancelledCaptureIds = new Set();
+const discoveries = new Map();
 const journeyJobs = new Map();
 const journeyLocks = new Map();
 const journeyTabTrackingJobs = new Map();
@@ -104,6 +130,10 @@ function normalizeCapturePreferences(value = {}) {
 function formatPackSize(bytes) {
   const gib = Number(bytes || 0) / (1024 * 1024 * 1024);
   return `${Number.isInteger(gib) ? gib : gib.toFixed(1)} GiB`;
+}
+
+function makeRequestId(prefix) {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 class CaptureCancelledError extends Error {
@@ -142,6 +172,10 @@ function sendPopupMessage(message) {
   } catch {
     // The popup may have closed between progress updates.
   }
+}
+
+function allowanceExhaustedMessage() {
+  return `You’ve used all ${PRICING.freePagesPerMonth} free pages this month. Upgrade to Pro to keep saving.`;
 }
 
 function captureErrorMessage(error) {
@@ -235,6 +269,29 @@ function parseTitle(html, fallbackUrl) {
   const match = String(html || "").match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const text = match?.[1]?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
   return text || fallbackUrl;
+}
+
+/**
+ * The site icon a fetched page declares, or the conventional `/favicon.ico`.
+ * The `<link>` itself is removed from the saved copy — nothing in the reader
+ * could show it there — so it is read here, before the tokeniser sees the page.
+ */
+function parseFaviconUrl(html, pageUrl) {
+  const links = String(html || "").match(/<link\b[^>]*>/gi) || [];
+  let fallback = "";
+  for (const tag of links) {
+    const rel = tag.match(/\brel\s*=\s*(["'])(.*?)\1/i)?.[2]?.toLowerCase() || "";
+    if (!/\bicon\b/.test(rel)) continue;
+    const href = tag.match(/\bhref\s*=\s*(["'])(.*?)\1/i)?.[2];
+    const url = normalizeUrl(href, pageUrl);
+    if (!isHttpUrl(url)) continue;
+    if (/\bapple-touch-icon\b/.test(rel)) {
+      fallback = fallback || url;
+      continue;
+    }
+    return url;
+  }
+  return fallback || normalizeUrl("/favicon.ico", pageUrl);
 }
 
 function makeToken(index) {
@@ -422,19 +479,23 @@ function dataUrlFromBytes(bytes, mimeType) {
   return `data:${mimeType || "application/octet-stream"};base64,${btoa(binary)}`;
 }
 
-function textFromDataUrl(value) {
+function bytesFromDataUrl(value) {
   const match = String(value || "").match(/^data:([^,]*?),(.*)$/s);
   if (!match) return null;
   try {
     if (/;base64/i.test(match[1])) {
       const binary = atob(match[2]);
-      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-      return new TextDecoder().decode(bytes);
+      return Uint8Array.from(binary, (character) => character.charCodeAt(0));
     }
-    return decodeURIComponent(match[2]);
+    return new TextEncoder().encode(decodeURIComponent(match[2]));
   } catch {
     return null;
   }
+}
+
+function textFromDataUrl(value) {
+  const bytes = bytesFromDataUrl(value);
+  return bytes ? new TextDecoder().decode(bytes) : null;
 }
 
 /**
@@ -445,18 +506,57 @@ function textFromDataUrl(value) {
  * cancellation would throw away every page saved so far — so the two have to stay
  * distinguishable even though both arrive as an `AbortError`.
  */
-function fetchWithTimeout(url, init = {}) {
-  const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+function fetchWithTimeout(url, init = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const timeout = AbortSignal.timeout(timeoutMs);
   const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
   return fetch(url, { ...init, signal }).catch((error) => {
     if (timeout.aborted && !init.signal?.aborted) {
-      throw new Error(`no response after ${Math.round(FETCH_TIMEOUT_MS / 1000)}s`);
+      throw new Error(`no response after ${Math.round(timeoutMs / 1000)}s`);
     }
     throw error;
   });
 }
 
-async function fetchResource(resource, resourceCache, visiting = new Set(), signal) {
+/**
+ * The bare-string form of `image-set()` inside a fetched stylesheet.
+ *
+ * `image-set("a.png" 1x)` carries a URL with no `url()` around it, so the
+ * `url()` pass above walks straight past it. Inline styles and `<style>` blocks
+ * were covered by `rewriteImageSet`; a stylesheet fetched as a file was not, and
+ * a remote address survived into the pack there. The `url()` form is already
+ * handled by the time this runs, so only quoted strings are touched.
+ */
+async function resolveCssImageSets(css, stylesheetUrl, resourceCache, visiting, signal, onBytes) {
+  const imageSets = [...css.matchAll(/((?:-webkit-)?image-set\()([^()]*(?:\([^()]*\)[^()]*)*)(\))/gi)];
+  let output = css;
+  for (const match of imageSets) {
+    const body = match[2];
+    let rewritten = body;
+    for (const quoted of body.matchAll(/(["'])([^"']+)\1/g)) {
+      const rawUrl = quoted[2].trim();
+      if (/^(data|blob):/i.test(rawUrl) || rawUrl.startsWith("#")) continue;
+      const nestedUrl = normalizeUrl(rawUrl, stylesheetUrl);
+      if (!isHttpUrl(nestedUrl)) continue;
+      let replacement;
+      try {
+        const nested = await fetchResource({ url: nestedUrl, kind: "asset" }, resourceCache, visiting, signal);
+        replacement = `${quoted[1]}${nested.dataUrl}${quoted[1]}`;
+        onBytes?.(nested.bytes);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        // Remove an unavailable candidate instead of leaving a CSP-blocked URL.
+        replacement = `${quoted[1]}${quoted[1]}`;
+      }
+      rewritten = rewritten.split(quoted[0]).join(replacement);
+    }
+    if (rewritten !== body) output = output.split(match[0]).join(`${match[1]}${rewritten}${match[3]}`);
+  }
+  return output;
+}
+
+// Exported for `tests/external-css.test.mjs`, which fetches a stylesheet through
+// this function against a stubbed network.
+export async function fetchResource(resource, resourceCache, visiting = new Set(), signal) {
   const cacheKey = `${resource.kind}:${resource.url}`;
   if (resourceCache.has(cacheKey)) return resourceCache.get(cacheKey);
   if (visiting.has(cacheKey)) throw new Error("cyclic resource reference");
@@ -510,6 +610,7 @@ async function fetchResource(resource, resourceCache, visiting = new Set(), sign
       }
     }
     for (const [from, to] of replacements) css = css.split(from).join(to);
+    css = await resolveCssImageSets(css, stylesheetUrl, resourceCache, visiting, signal, (nestedBytes) => { outputBytes += nestedBytes; });
     outputBytes += new TextEncoder().encode(css).byteLength - bytes.byteLength;
     outputBytes = Math.max(outputBytes, bytes.byteLength);
     outputData = new TextEncoder().encode(css);
@@ -518,6 +619,73 @@ async function fetchResource(resource, resourceCache, visiting = new Set(), sign
   const result = { dataUrl: dataUrlFromBytes(outputData, mimeType), bytes: outputBytes };
   resourceCache.set(cacheKey, result);
   return result;
+}
+
+/**
+ * A site icon, small and inlined, or null. Never an issue in the save's report:
+ * an icon is decoration for the library row, not part of the page.
+ */
+async function fetchFavicon(iconUrl, resourceCache, signal) {
+  const url = normalizeUrl(iconUrl);
+  if (!isHttpUrl(url)) return null;
+  const cacheKey = `icon:${url}`;
+  if (resourceCache.has(cacheKey)) return resourceCache.get(cacheKey);
+  let result = null;
+  try {
+    const response = await fetchWithTimeout(url, { credentials: "include", redirect: "follow", signal }, 8000);
+    const mimeType = response.headers.get("content-type")?.split(";")[0]?.trim() || "";
+    const contentLength = Number(response.headers.get("content-length") || 0);
+    if (response.ok && /^image\//i.test(mimeType) && contentLength <= FAVICON_MAX_BYTES) {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (bytes.byteLength > 0 && bytes.byteLength <= FAVICON_MAX_BYTES) result = dataUrlFromBytes(bytes, mimeType);
+    }
+  } catch (error) {
+    if (signal?.aborted) throw error;
+  }
+  resourceCache.set(cacheKey, result);
+  return result;
+}
+
+async function attachFavicon(page, iconUrl, resourceCache, signal) {
+  if (!iconUrl) return;
+  const favicon = await fetchFavicon(iconUrl, resourceCache, signal).catch((error) => {
+    if (signal?.aborted) throw error;
+    return null;
+  });
+  if (favicon) page.favicon = favicon;
+}
+
+/**
+ * A picture of the tab as it is right now, for the full-page library.
+ *
+ * Only ever the active tab of its window — `captureVisibleTab` photographs
+ * whatever is on screen, so asking for it while another tab is in front would
+ * file the wrong picture under this save. The call needs `activeTab`, which
+ * Chrome grants for the tab the user's gesture was on — the popup, the
+ * shortcut, the menu — and for no other; a plain host permission does not
+ * cover it, and without the grant the call refuses and the save simply has no
+ * picture. Scaled down here, in the worker, with an `OffscreenCanvas`; a
+ * full-size screenshot is a megabyte the library would never show at that size.
+ */
+async function captureTabThumbnail(tabId) {
+  if (!Number.isInteger(tabId) || typeof chrome.tabs?.captureVisibleTab !== "function") return null;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab?.active || !isHttpUrl(tab.url)) return null;
+    const shot = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 70 });
+    const bytes = bytesFromDataUrl(shot);
+    if (!bytes) return null;
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
+    const scale = Math.max(THUMBNAIL_SIZE.width / bitmap.width, THUMBNAIL_SIZE.height / bitmap.height);
+    const canvas = new OffscreenCanvas(THUMBNAIL_SIZE.width, THUMBNAIL_SIZE.height);
+    const context = canvas.getContext("2d");
+    context.drawImage(bitmap, 0, 0, Math.ceil(bitmap.width * scale), Math.ceil(bitmap.height * scale));
+    bitmap.close?.();
+    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.74 });
+    return dataUrlFromBytes(new Uint8Array(await blob.arrayBuffer()), "image/jpeg");
+  } catch {
+    return null;
+  }
 }
 
 async function repairCssDataUrl(dataUrl, baseUrl, resourceCache) {
@@ -550,6 +718,11 @@ async function repairCssDataUrl(dataUrl, baseUrl, resourceCache) {
     } catch {
       // Leave an unavailable dependency untouched; the existing fallback remains usable online.
     }
+  }
+  const withImageSets = await resolveCssImageSets(css, baseUrl, resourceCache, new Set(), undefined).catch(() => css);
+  if (withImageSets !== css) {
+    css = withImageSets;
+    changed = true;
   }
   return changed ? dataUrlFromBytes(new TextEncoder().encode(css), "text/css") : dataUrl;
 }
@@ -729,9 +902,27 @@ function linksFromMarkup(markup, pageUrl) {
   return { links, truncated };
 }
 
+/** The same rule as `linksFromMarkup`, over links the live page reported. */
+function inScopeLinks(links, pageUrl) {
+  const kept = [];
+  const seen = new Set([normalizeUrl(pageUrl)]);
+  let truncated = false;
+  for (const link of Array.isArray(links) ? links : []) {
+    const url = normalizeUrl(link?.href, pageUrl);
+    if (!isHttpUrl(url) || seen.has(url) || !isLinkInScope(url, pageUrl)) continue;
+    if (kept.length >= MAX_LINKS_PER_PAGE) {
+      truncated = true;
+      break;
+    }
+    seen.add(url);
+    kept.push({ url, title: String(link?.text || "").trim() || url });
+  }
+  return { links: kept, truncated };
+}
+
 async function fetchPageSource(url, options) {
   throwIfCaptureCancelled(options.requestId);
-  const response = await fetchWithTimeout(url, { credentials: "include", redirect: "follow", signal: options.signal });
+  const response = await fetchWithTimeout(url, { credentials: "include", redirect: "follow", signal: options.signal }, options.timeoutMs || FETCH_TIMEOUT_MS);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("html") && !contentType.includes("xhtml")) throw new Error("not an HTML page");
@@ -741,6 +932,7 @@ async function fetchPageSource(url, options) {
   return {
     url: normalizeUrl(response.url || url),
     title: parseTitle(html, url),
+    faviconUrl: parseFaviconUrl(html, normalizeUrl(response.url || url)),
     html: prepared.html,
     resources: prepared.resources,
   };
@@ -768,7 +960,7 @@ function streamPageFromTab(tabId, requestId, options) {
   });
 }
 
-async function captureLivePage(tabId, requestId, { runScripts, captureMedia }) {
+async function captureLivePage(tabId, requestId, { runScripts, captureMedia }, onProgress = () => {}) {
   const root = await streamPageFromTab(tabId, requestId, { runScripts, captureMedia });
   const page = {
     url: normalizeUrl(root.meta?.url),
@@ -780,7 +972,8 @@ async function captureLivePage(tabId, requestId, { runScripts, captureMedia }) {
   };
   if (!page.url) throw new Error("The page URL could not be recorded.");
   const resourceCache = new Map();
-  const resourceResult = await hydrateResources(page, resourceCache, { runScripts, captureMedia, requestId }, () => {});
+  const resourceResult = await hydrateResources(page, resourceCache, { runScripts, captureMedia, requestId }, onProgress);
+  await attachFavicon(page, root.meta?.favicon, resourceCache);
   return {
     page,
     bytes: resourceResult.bytes,
@@ -791,6 +984,7 @@ async function captureLivePage(tabId, requestId, { runScripts, captureMedia }) {
 
 let journeyBadge = { count: 0, active: false };
 let captureBadge = { active: false, pages: 0, following: false };
+let badgeErrorTimer = 0;
 
 /** What a running save shows when it has no page count to report. */
 export const CAPTURE_WORKING_BADGE = "•";
@@ -836,6 +1030,7 @@ export function captureBadgeText({ following, pages }) {
  */
 function paintActionBadge() {
   try {
+    clearTimeout(badgeErrorTimer);
     if (journeyBadge.active) {
       const count = journeyBadge.count;
       chrome.action.setBadgeBackgroundColor({ color: "#b85c5c" });
@@ -856,6 +1051,23 @@ function paintActionBadge() {
     }
     chrome.action.setBadgeText({ text: "" });
     chrome.action.setTitle({ title: "Save this page offline" });
+  } catch {
+    // Badge updates are only a visual enhancement.
+  }
+}
+
+/**
+ * A save started from the keyboard or a context menu has no popup to report to.
+ * A refusal shows on the badge for a few seconds, with the reason as the icon's
+ * tooltip, and then the badge goes back to whatever it was showing.
+ */
+function flashBadgeError(message) {
+  try {
+    clearTimeout(badgeErrorTimer);
+    chrome.action.setBadgeBackgroundColor({ color: "#d70015" });
+    chrome.action.setBadgeText({ text: "!" });
+    chrome.action.setTitle({ title: `PagePack: ${message}` });
+    badgeErrorTimer = setTimeout(paintActionBadge, BADGE_ERROR_MS);
   } catch {
     // Badge updates are only a visual enhancement.
   }
@@ -931,7 +1143,7 @@ function wait(milliseconds) {
 
 async function captureQueuedJourneyTarget(journey, item) {
   const expectedUrl = normalizeJourneyUrl(item.url);
-  const requestId = `journey_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const requestId = makeRequestId("journey");
   let tab = null;
   for (let attempt = 0; attempt < 12; attempt += 1) {
     try {
@@ -967,6 +1179,8 @@ async function captureQueuedJourneyTarget(journey, item) {
     const page = { ...fetched, url: expectedUrl, resourceMap: {}, capturedAt: Date.now() };
     const resourceCache = new Map();
     const resourceResult = await hydrateResources(page, resourceCache, options, () => {});
+    await attachFavicon(page, page.faviconUrl, resourceCache);
+    delete page.faviconUrl;
     return {
       page,
       bytes: resourceResult.bytes,
@@ -1192,12 +1406,10 @@ async function startJourney(message) {
   }
   const monetization = await getMonetizationState({ refresh: true });
   const isPaid = monetization.entitlement.paid;
-  if (!isPaid && monetization.remaining < 1) {
-    throw new Error(`You’ve used all ${PRICING.freePagesPerMonth} free saves this month. Upgrade to Pro to keep saving.`);
-  }
+  if (!isPaid && monetization.remaining < 1) throw new Error(allowanceExhaustedMessage());
   const packLimits = effectivePackLimits(message, isPaid);
   const journey = {
-    id: `journey_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    id: makeRequestId("journey"),
     state: "recording",
     rootUrl: normalizeUrl(message.pageUrl),
     title: message.pageTitle || message.pageUrl,
@@ -1258,6 +1470,7 @@ async function finishJourney(journeyId, excludedUrls = []) {
     scope: "journey",
     sortOrder: -1,
     folderId: latest.folderId || DEFAULT_FOLDER_ID,
+    favicon: pages[0].favicon || null,
     pages,
     failures: latest.failures || [],
     visits,
@@ -1295,6 +1508,159 @@ async function discardJourney(journeyId) {
   sendPopupMessage({ type: "JOURNEY_DISCARDED", journeyId });
 }
 
+/* ------------------------------------------------------------------ *
+ * Pre-flight: what a linked save would take
+ * ------------------------------------------------------------------ */
+
+function pruneDiscoveries() {
+  const now = Date.now();
+  for (const [id, discovery] of discoveries) {
+    if (now - discovery.createdAt > DISCOVERY_TTL_MS) discoveries.delete(id);
+  }
+}
+
+/** A discovery the save can reuse, removed from the cache as it is taken. */
+function takeDiscovery(id) {
+  pruneDiscoveries();
+  const discovery = discoveries.get(String(id || ""));
+  if (discovery) discoveries.delete(discovery.id);
+  return discovery || null;
+}
+
+/**
+ * Find the same-site pages a linked save from this tab would collect, before
+ * anything is saved.
+ *
+ * The first level comes from the live page — every link on it, read out of the
+ * DOM without cloning anything. Deeper levels have to be fetched to know what
+ * they link to, so those pages are fetched here as HTML only, kept for ten
+ * minutes, and handed to the save that follows so nothing is downloaded twice.
+ *
+ * The size is an estimate and is labelled as one. The live page reports what it
+ * weighed when it loaded; a discovered page is guessed from its own markup plus
+ * the same per-resource cost the live page showed. A number the save will beat
+ * is preferable to one it will miss.
+ */
+async function discoverLinkedPages(message) {
+  const tabId = Number(message.tabId);
+  if (!Number.isInteger(tabId) || !isHttpUrl(message.pageUrl)) throw new Error("This page cannot be saved with its links.");
+  const depth = clampDepth(message.depth);
+  const maxPages = normalizePackLimits(message).maxPages;
+  const runScripts = message.runScripts !== false;
+  const options = { runScripts, captureMedia: true, timeoutMs: DISCOVERY_FETCH_TIMEOUT_MS };
+  const root = await readTabMessage(tabId, { type: "PAGEPACK_LINKS_REQUEST" });
+  const rootUrl = normalizeUrl(root.url || message.pageUrl);
+  const rootResources = Number(root.resourceCount) || 0;
+  const measuredBytes = Number(root.resourceBytes) || 0;
+  const perResource = rootResources && measuredBytes ? measuredBytes / rootResources : FALLBACK_RESOURCE_BYTES;
+  const rootBytes = (Number(root.htmlLength) || 0) + (measuredBytes || Math.max(1, Number(root.imageCount) || 0) * perResource);
+  const estimateFetched = (fetched) => fetched.html.length + (fetched.resources?.length || 0) * perResource;
+
+  const visited = new Set([rootUrl]);
+  const pages = [];
+  const prefetched = new Map();
+  const truncatedPages = [];
+  let pageLimitReached = false;
+  let unreachable = 0;
+  const first = inScopeLinks(root.links, rootUrl);
+  if (first.truncated) truncatedPages.push(rootUrl);
+  let frontier = [];
+  for (const link of first.links) {
+    if (pages.length + 1 >= maxPages) {
+      pageLimitReached = true;
+      break;
+    }
+    visited.add(link.url);
+    const page = { url: link.url, title: link.title, level: 1, parentUrl: rootUrl, estimatedBytes: rootBytes || FALLBACK_PAGE_BYTES };
+    pages.push(page);
+    frontier.push(page);
+  }
+
+  for (let level = 1; level < depth && frontier.length && !pageLimitReached; level += 1) {
+    const next = [];
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(DISCOVERY_CONCURRENCY, frontier.length) }, async () => {
+      while (cursor < frontier.length) {
+        const page = frontier[cursor++];
+        let fetched;
+        try {
+          fetched = await fetchPageSource(page.url, options);
+        } catch {
+          unreachable += 1;
+          continue;
+        }
+        prefetched.set(page.url, fetched);
+        page.title = fetched.title || page.title;
+        page.estimatedBytes = estimateFetched(fetched);
+        const links = linksFromMarkup(fetched.html, page.url);
+        if (links.truncated) truncatedPages.push(page.url);
+        for (const url of links.links) {
+          if (visited.has(url)) continue;
+          if (pages.length + 1 >= maxPages) {
+            pageLimitReached = true;
+            return;
+          }
+          visited.add(url);
+          const child = { url, title: url, level: level + 1, parentUrl: page.url, estimatedBytes: rootBytes || FALLBACK_PAGE_BYTES };
+          pages.push(child);
+          next.push(child);
+        }
+      }
+    });
+    await Promise.all(workers);
+    frontier = next;
+  }
+
+  /* Titles for the last level are read from the pages themselves when that
+     costs nothing more than the save would spend anyway: the fetched markup is
+     what the capture reuses. Past the first hundred, a title is not worth a
+     request the user has not asked for. */
+  const untitled = pages.filter((page) => !prefetched.has(page.url) && page.title === page.url).slice(0, 100);
+  if (untitled.length) {
+    let cursor = 0;
+    await Promise.all(Array.from({ length: Math.min(DISCOVERY_CONCURRENCY, untitled.length) }, async () => {
+      while (cursor < untitled.length) {
+        const page = untitled[cursor++];
+        try {
+          const fetched = await fetchPageSource(page.url, options);
+          prefetched.set(page.url, fetched);
+          page.title = fetched.title || page.title;
+          page.estimatedBytes = estimateFetched(fetched);
+        } catch {
+          unreachable += 1;
+        }
+      }
+    }));
+  }
+
+  const discovery = {
+    id: makeRequestId("discovery"),
+    createdAt: Date.now(),
+    rootUrl,
+    runScripts,
+    pages,
+    prefetched,
+  };
+  pruneDiscoveries();
+  discoveries.set(discovery.id, discovery);
+  const estimatedBytes = Math.round(rootBytes + pages.reduce((sum, page) => sum + (Number(page.estimatedBytes) || 0), 0));
+  return {
+    discoveryId: discovery.id,
+    rootUrl,
+    rootTitle: root.title || message.pageTitle || rootUrl,
+    depth,
+    pages: pages.map(({ url, title, level, parentUrl, estimatedBytes: bytes }) => ({ url, title, level, parentUrl, estimatedBytes: Math.round(bytes || 0) })),
+    estimatedBytes,
+    truncatedPages,
+    pageLimitReached,
+    unreachable,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Captures
+ * ------------------------------------------------------------------ */
+
 const CAPTURE_PHASE_STATES = Object.freeze({
   queued: "queued",
   reading: "reading",
@@ -1323,28 +1689,9 @@ function cancelCaptureStream(requestId) {
   }
 }
 
-async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, folderId, requestId, maxPages, maxTotalBytes, countAgainstQuota }) {
-  const job = {
-    abortController: new AbortController(),
-    cancelled: cancelledCaptureIds.has(requestId),
-    committed: false,
-  };
-  captureJobs.set(requestId, job);
-  // Only a link-following save has a page count worth showing; a single-page
-  // save keeps the plain dot.
-  setCaptureBadge(true, { following: clampDepth(depth) > 0 });
-  const progress = {
-    phase: "reading",
-    pagesDone: 0,
-    pagesTotal: 1,
-    assetsDone: 0,
-    assetsTotal: 0,
-    // Link-following discovers pages as it goes, so only a single-page save can
-    // promise an honest percentage.
-    determinate: Number(depth) === 0,
-  };
+function makeProgressPublisher(requestId, progress) {
   let lastProgressAt = 0;
-  const publishProgress = async (force = false) => {
+  return async (force = false) => {
     const now = Date.now();
     if (!force && now - lastProgressAt < 250) return;
     lastProgressAt = now;
@@ -1352,177 +1699,393 @@ async function runCapture({ tabId, pageUrl, depth, runScripts, captureMedia, fol
     sendPopupMessage({ type: "CAPTURE_PROGRESS", requestId, ...payload });
     await updateCapture(requestId, { state: CAPTURE_PHASE_STATES[progress.phase] || "saving", ...payload }).catch(() => {});
   };
-  try {
-    throwIfCaptureCancelled(requestId);
-    await publishProgress(true);
-  const options = { runScripts, captureMedia, requestId, signal: job.abortController.signal };
-  let root;
-  try {
-    root = await streamPageFromTab(tabId, requestId, { runScripts, captureMedia });
-  } catch (liveError) {
-    // A content script can be unavailable on a page even though the page can
-    // still be fetched. Keep the save useful by falling back to the network
-    // snapshot before surfacing the error.
-    try {
-      const fetched = await fetchPageSource(pageUrl, options);
-      root = {
-        meta: { url: fetched.url, title: fetched.title, resources: fetched.resources },
-        html: fetched.html,
-      };
-    } catch {
-      throw liveError;
-    }
-  }
-  const resourceCache = new Map();
-  const pages = [];
-  const failures = [];
-  let totalBytes = 0;
-  let processedPages = 0;
-  let pageLimitReached = false;
-  let byteLimitReached = false;
-  // Pages whose resources were actually fetched. A page left in the queue when
-  // the size ceiling stopped the run has markup made only of unresolved tokens,
-  // so it must not reach the library.
-  const hydratedPages = new Set();
-  const packLimits = normalizePackLimits({ maxPages, maxTotalBytes });
-  const capturePageLimit = packLimits.maxPages;
-  const rootPage = {
-    url: normalizeUrl(root.meta.url),
-    title: root.meta.title || root.meta.url,
-    html: root.html,
-    resources: root.meta.resources || [],
-    resourceMap: {},
+}
+
+/**
+ * One save: the page, and whatever it links to or was planned for it.
+ *
+ * `plan` is the list of pages a pre-flight or an update settled on. With a plan
+ * there is nothing to discover, so the total is known from the start, the bar
+ * can be honest about it, and pages the pre-flight already fetched (`prefetched`)
+ * are not fetched again. Without one the save crawls, as it always has.
+ *
+ * `updatePackId` re-captures into an existing save, keeping its id, its folder
+ * and its place in that folder.
+ */
+async function runCapture({
+  tabId, pageUrl, depth, runScripts, captureMedia, folderId, requestId, maxPages, maxTotalBytes, countAgainstQuota,
+  plan = null, prefetched = null, updatePackId = null, source = "tab",
+}) {
+  const job = {
+    abortController: new AbortController(),
+    cancelled: cancelledCaptureIds.has(requestId),
+    committed: false,
   };
-  // `captureLivePage` guards this for the live tab; this path did not, and an
-  // address `normalizeUrl` could not parse produced an empty string that reached
-  // `isLinkInScope`, where `new URL("")` threw a bare TypeError and failed the
-  // whole save with a message about an invalid URL.
-  if (!rootPage.url) throw new Error("This page's address could not be read, so it cannot be saved.");
-  pages.push(rootPage);
-
-  const visited = new Set([rootPage.url]);
-  const queue = [{ url: rootPage.url, level: 0 }];
-  while (queue.length) {
+  captureJobs.set(requestId, job);
+  const planned = Array.isArray(plan) ? [...new Set(plan.map((url) => normalizeUrl(url)).filter(isHttpUrl))] : null;
+  // Only a save with more than one page has a page count worth showing; a
+  // single-page save keeps the plain dot.
+  setCaptureBadge(true, { following: clampDepth(depth) > 0 || Boolean(planned?.length) });
+  const progress = {
+    phase: "reading",
+    pagesDone: 0,
+    pagesTotal: planned ? 1 + planned.length : 1,
+    assetsDone: 0,
+    assetsTotal: 0,
+    pageAssetsDone: 0,
+    pageAssetsTotal: 0,
+    bytesDone: 0,
+    // Link-following discovers pages as it goes, so only a save that knows its
+    // pages up front — a single page, or a planned one — can promise an honest
+    // percentage.
+    determinate: Number(depth) === 0 || Boolean(planned),
+  };
+  const publishProgress = makeProgressPublisher(requestId, progress);
+  try {
     throwIfCaptureCancelled(requestId);
-    const current = queue.shift();
-    if (current.level > depth) continue;
-    const page = pages.find((item) => item.url === current.url);
-    if (!page) continue;
-    progress.phase = "assets";
-    progress.pagesTotal = pages.length;
-    const assetsBefore = progress.assetsDone;
-    const assetTotalBefore = progress.assetsTotal;
     await publishProgress(true);
-    const resourceResult = await hydrateResources(page, resourceCache, options, (done, total) => {
-      progress.assetsDone = assetsBefore + done;
-      progress.assetsTotal = assetTotalBefore + total;
-      publishProgress();
-    });
-    throwIfCaptureCancelled(requestId);
-    processedPages += 1;
-    progress.pagesDone = processedPages;
-    setCaptureBadgePages(processedPages);
-    totalBytes += resourceResult.bytes;
-    failures.push(...resourceResult.failures.map((failure) => ({ ...failure, type: "resource", pageUrl: page.url })));
-    hydratedPages.add(page);
-    /* Stop, keep what is already saved, and say so.
+    const options = { runScripts, captureMedia, requestId, signal: job.abortController.signal };
+    const useTab = source !== "fetch" && Number.isInteger(tabId);
+    // Before the page is read, while the tab is certainly the one on screen.
+    const thumbnail = useTab ? await captureTabThumbnail(tabId) : null;
+    let root;
+    if (useTab) {
+      try {
+        root = await streamPageFromTab(tabId, requestId, { runScripts, captureMedia });
+      } catch (liveError) {
+        // A content script can be unavailable on a page even though the page can
+        // still be fetched. Keep the save useful by falling back to the network
+        // snapshot before surfacing the error.
+        try {
+          const fetched = await fetchPageSource(pageUrl, options);
+          root = { meta: { url: fetched.url, title: fetched.title, favicon: fetched.faviconUrl, resources: fetched.resources }, html: fetched.html };
+        } catch {
+          throw liveError;
+        }
+      }
+    } else {
+      const fetched = await fetchPageSource(pageUrl, options);
+      root = { meta: { url: fetched.url, title: fetched.title, favicon: fetched.faviconUrl, resources: fetched.resources }, html: fetched.html };
+    }
+    const resourceCache = new Map();
+    const pages = [];
+    const failures = [];
+    let totalBytes = 0;
+    let processedPages = 0;
+    let pageLimitReached = false;
+    let byteLimitReached = false;
+    // Pages whose resources were actually fetched. A page left in the queue when
+    // the size ceiling stopped the run has markup made only of unresolved tokens,
+    // so it must not reach the library.
+    const hydratedPages = new Set();
+    const packLimits = normalizePackLimits({ maxPages, maxTotalBytes });
+    const capturePageLimit = packLimits.maxPages;
+    const rootPage = {
+      url: normalizeUrl(root.meta.url),
+      title: root.meta.title || root.meta.url,
+      html: root.html,
+      resources: root.meta.resources || [],
+      resourceMap: {},
+      capturedAt: Date.now(),
+    };
+    const rootIconUrl = root.meta.favicon;
+    // `captureLivePage` guards this for the live tab; this path did not, and an
+    // address `normalizeUrl` could not parse produced an empty string that reached
+    // `isLinkInScope`, where `new URL("")` threw a bare TypeError and failed the
+    // whole save with a message about an invalid URL.
+    if (!rootPage.url) throw new Error("This page's address could not be read, so it cannot be saved.");
+    pages.push(rootPage);
 
-       This used to `throw`, which failed the whole capture and wrote nothing: a
-       249-page crawl that crossed the ceiling on page 250 discarded all 249 and
-       told the user only that the save was too large. The page cap immediately
-       below had always degraded gracefully instead. There was no reason for the
-       two ceilings to behave differently, and the destructive one was the
-       surprise. Pages fetched but not yet hydrated are dropped below, because
-       their markup is all unresolved tokens. */
-    if (totalBytes > packLimits.maxTotalBytes) {
-      byteLimitReached = true;
-      break;
+    const visited = new Set([rootPage.url]);
+    const queue = [{ url: rootPage.url, level: 0, iconUrl: rootIconUrl }];
+    const followLinks = !planned;
+    if (planned) {
+      for (const url of planned) {
+        if (visited.has(url)) continue;
+        visited.add(url);
+        queue.push({ url, level: 1, planned: true });
+      }
     }
-    // Nothing more will be added once the page cap is reached, so there is no
-    // point re-reading the links of every page still in the queue.
-    if (current.level >= depth || pageLimitReached) continue;
-    const pageLinks = linksFromMarkup(page.html, page.url);
-    if (pageLinks.truncated) {
-      failures.push({
-        type: "page-limit",
-        pageUrl: page.url,
-        message: `This page had more than ${MAX_LINKS_PER_PAGE} links, so only the first ${MAX_LINKS_PER_PAGE} were followed.`,
-      });
-    }
-    for (const url of pageLinks.links) {
+    while (queue.length) {
       throwIfCaptureCancelled(requestId);
-      if (visited.has(url)) continue;
-      if (pages.length >= capturePageLimit) {
-        pageLimitReached = true;
+      const current = queue.shift();
+      if (current.level > depth && !current.planned) continue;
+      let page = pages.find((item) => item.url === current.url);
+      if (!page && current.planned) {
+        if (pages.length >= capturePageLimit) {
+          pageLimitReached = true;
+          continue;
+        }
+        try {
+          const fetched = prefetched?.get(current.url) || await fetchPageSource(current.url, options);
+          page = { ...fetched, resourceMap: {}, capturedAt: Date.now() };
+          pages.push(page);
+        } catch (error) {
+          if (isCaptureCancelled(requestId)) throw error;
+          failures.push({ type: "page", url: current.url, message: error.message || "The linked page could not be saved." });
+          continue;
+        }
+      }
+      if (!page) continue;
+      progress.phase = "assets";
+      if (!planned) progress.pagesTotal = pages.length;
+      const assetsBefore = progress.assetsDone;
+      const assetTotalBefore = progress.assetsTotal;
+      await publishProgress(true);
+      const resourceResult = await hydrateResources(page, resourceCache, options, (done, total) => {
+        progress.assetsDone = assetsBefore + done;
+        progress.assetsTotal = assetTotalBefore + total;
+        progress.pageAssetsDone = done;
+        progress.pageAssetsTotal = total;
+        publishProgress();
+      });
+      throwIfCaptureCancelled(requestId);
+      await attachFavicon(page, current.iconUrl || page.faviconUrl, resourceCache, options.signal);
+      delete page.faviconUrl;
+      page.bytes = resourceResult.bytes;
+      page.resourceCount = resourceResult.failures.length + Object.keys(page.resourceMap).length ? (page.resources || []).length : 0;
+      processedPages += 1;
+      progress.pagesDone = processedPages;
+      setCaptureBadgePages(processedPages);
+      totalBytes += resourceResult.bytes;
+      progress.bytesDone = totalBytes;
+      failures.push(...resourceResult.failures.map((failure) => ({ ...failure, type: "resource", pageUrl: page.url })));
+      hydratedPages.add(page);
+      /* Stop, keep what is already saved, and say so.
+
+         This used to `throw`, which failed the whole capture and wrote nothing: a
+         249-page crawl that crossed the ceiling on page 250 discarded all 249 and
+         told the user only that the save was too large. The page cap immediately
+         below had always degraded gracefully instead. There was no reason for the
+         two ceilings to behave differently, and the destructive one was the
+         surprise. Pages fetched but not yet hydrated are dropped below, because
+         their markup is all unresolved tokens. */
+      if (totalBytes > packLimits.maxTotalBytes) {
+        byteLimitReached = true;
         break;
       }
-      visited.add(url);
-      try {
-        const fetched = await fetchPageSource(url, options);
-        const child = { ...fetched, resourceMap: {} };
-        pages.push(child);
-        queue.push({ url: child.url, level: current.level + 1 });
-      } catch (error) {
-        if (isCaptureCancelled(requestId)) throw error;
-        failures.push({ type: "page", url, message: error.message || "The linked page could not be saved." });
+      // Nothing more will be added once the page cap is reached, so there is no
+      // point re-reading the links of every page still in the queue.
+      if (!followLinks || current.level >= depth || pageLimitReached) continue;
+      const pageLinks = linksFromMarkup(page.html, page.url);
+      if (pageLinks.truncated) {
+        failures.push({
+          type: "page-limit",
+          pageUrl: page.url,
+          message: `This page had more than ${MAX_LINKS_PER_PAGE} links, so only the first ${MAX_LINKS_PER_PAGE} were followed.`,
+        });
+      }
+      for (const url of pageLinks.links) {
+        throwIfCaptureCancelled(requestId);
+        if (visited.has(url)) continue;
+        if (pages.length >= capturePageLimit) {
+          pageLimitReached = true;
+          break;
+        }
+        visited.add(url);
+        try {
+          const fetched = await fetchPageSource(url, options);
+          const child = { ...fetched, resourceMap: {}, capturedAt: Date.now() };
+          pages.push(child);
+          queue.push({ url: child.url, level: current.level + 1 });
+        } catch (error) {
+          if (isCaptureCancelled(requestId)) throw error;
+          failures.push({ type: "page", url, message: error.message || "The linked page could not be saved." });
+        }
       }
     }
-  }
 
-  if (pageLimitReached) {
-    failures.push({
-      type: "page-limit",
-      message: `This pack reached PagePack’s ${packLimits.maxPages}-page safety limit.`,
+    if (pageLimitReached) {
+      failures.push({
+        type: "page-limit",
+        message: `This pack reached PagePack’s ${packLimits.maxPages}-page safety limit.`,
+      });
+    }
+
+    // A page that was fetched but never hydrated has markup made entirely of
+    // unresolved resource tokens, so it would open blank. Only reachable when the
+    // size ceiling stopped the run early.
+    const droppedPages = pages.length - hydratedPages.size;
+    const savedPages = droppedPages ? pages.filter((page) => hydratedPages.has(page)) : pages;
+    if (byteLimitReached) {
+      failures.push({
+        type: "pack-limit",
+        message: `This save reached PagePack’s ${formatPackSize(packLimits.maxTotalBytes)} size limit, so it stopped early`
+          + `${droppedPages ? ` and left out ${droppedPages} page${droppedPages === 1 ? "" : "s"}` : ""}.`
+          + " The pages already saved were kept. Raise the limit under Options, or save fewer linked pages.",
+      });
+    }
+
+    const stats = { pages: savedPages.length, bytes: totalBytes, resources: resourceCache.size, failed: failures.length };
+    let pack;
+    if (updatePackId) {
+      const existing = await getPack(updatePackId);
+      if (!existing) throw new Error("That save no longer exists, so it could not be updated.");
+      const pageUrls = new Set(savedPages.map((page) => page.url));
+      pack = {
+        ...existing,
+        rootUrl: rootPage.url,
+        title: rootPage.title,
+        updatedAt: Date.now(),
+        depth,
+        runScripts: Boolean(runScripts),
+        limits: packLimits,
+        favicon: rootPage.favicon || existing.favicon || null,
+        pages: savedPages,
+        failures,
+        visits: (existing.visits || []).filter((visit) => pageUrls.has(normalizeUrl(visit.pageUrl))),
+        stats,
+      };
+    } else {
+      pack = {
+        id: makePackId(),
+        rootUrl: rootPage.url,
+        title: rootPage.title,
+        savedAt: Date.now(),
+        depth,
+        runScripts: Boolean(runScripts),
+        scope: "site",
+        sortOrder: -1,
+        folderId: folderId || DEFAULT_FOLDER_ID,
+        favicon: rootPage.favicon || null,
+        limits: packLimits,
+        pages: savedPages,
+        failures,
+        stats,
+      };
+    }
+    throwIfCaptureCancelled(requestId);
+    progress.phase = "finishing";
+    progress.pagesTotal = savedPages.length;
+    await publishProgress(true);
+    await putPack(pack);
+    job.committed = true;
+    if (thumbnail) await putThumbnail(pack.id, thumbnail).catch(() => {});
+    // The allowance is charged for what was kept, not for what was fetched.
+    if (countAgainstQuota) await consumeFreePages(savedPages.length).catch(() => {});
+    await deleteCapture(requestId).catch(() => {});
+    // Keep completion messages small. The popup reloads the compact library
+    // index instead of receiving the captured HTML through the message bus.
+    sendPopupMessage({
+      type: "CAPTURE_COMPLETE",
+      requestId,
+      packId: pack.id,
+      pages: pack.stats.pages,
+      failed: pack.stats.failed,
+      updated: Boolean(updatePackId),
     });
+  } finally {
+    captureJobs.delete(requestId);
+    setCaptureBadge(false);
   }
+}
 
-  // A page that was fetched but never hydrated has markup made entirely of
-  // unresolved resource tokens, so it would open blank. Only reachable when the
-  // size ceiling stopped the run early.
-  const droppedPages = pages.length - hydratedPages.size;
-  const savedPages = droppedPages ? pages.filter((page) => hydratedPages.has(page)) : pages;
-  if (byteLimitReached) {
-    failures.push({
-      type: "pack-limit",
-      message: `This save reached PagePack’s ${formatPackSize(packLimits.maxTotalBytes)} size limit, so it stopped early`
-        + `${droppedPages ? ` and left out ${droppedPages} page${droppedPages === 1 ? "" : "s"}` : ""}.`
-        + " The pages already saved were kept. Raise the limit under Options, or save fewer linked pages.",
-    });
-  }
-
-  const pack = {
-    id: makePackId(),
-    rootUrl: rootPage.url,
-    title: rootPage.title,
-    savedAt: Date.now(),
-    depth,
-    runScripts: Boolean(runScripts),
-    scope: "site",
-    sortOrder: -1,
-    folderId: folderId || DEFAULT_FOLDER_ID,
-    limits: packLimits,
-    pages: savedPages,
-    failures,
-    stats: { pages: savedPages.length, bytes: totalBytes, resources: resourceCache.size, failed: failures.length },
+/**
+ * Every open tab in a window, each as its own save.
+ *
+ * One capture record and one progress card for the whole run, one pack per tab:
+ * that is what "save all tabs" means to the person asking for it. Each tab is
+ * captured from its own live DOM — the content script is injected into it —
+ * without switching to it, so only the tab that was in front gets a picture. A
+ * tab that fails is recorded and the run moves on; a cancel keeps the packs
+ * already written, and says how many.
+ */
+async function runBatchCapture({ requestId, tabs, runScripts, captureMedia, folderId, maxPages, maxTotalBytes, countAgainstQuota }) {
+  const job = {
+    abortController: new AbortController(),
+    cancelled: cancelledCaptureIds.has(requestId),
+    committed: false,
   };
-  throwIfCaptureCancelled(requestId);
-  progress.phase = "finishing";
-  progress.pagesTotal = savedPages.length;
-  await publishProgress(true);
-  await putPack(pack);
-  job.committed = true;
-  // The allowance is charged for what was kept, not for what was fetched.
-  if (countAgainstQuota) await consumeFreePages(savedPages.length).catch(() => {});
-  await deleteCapture(requestId).catch(() => {});
-  // Keep completion messages small. The popup reloads the compact library
-  // index instead of receiving the captured HTML through the message bus.
-  sendPopupMessage({
-    type: "CAPTURE_COMPLETE",
-    requestId,
-    packId: pack.id,
-    pages: pack.stats.pages,
-    failed: pack.stats.failed,
-  });
+  captureJobs.set(requestId, job);
+  setCaptureBadge(true, { following: true });
+  const progress = {
+    phase: "reading",
+    pagesDone: 0,
+    pagesTotal: tabs.length,
+    assetsDone: 0,
+    assetsTotal: 0,
+    pageAssetsDone: 0,
+    pageAssetsTotal: 0,
+    bytesDone: 0,
+    determinate: true,
+    unit: "tabs",
+  };
+  const publishProgress = makeProgressPublisher(requestId, progress);
+  const packLimits = normalizePackLimits({ maxPages, maxTotalBytes });
+  const saved = [];
+  const failedTabs = [];
+  try {
+    await publishProgress(true);
+    for (const [index, tab] of tabs.entries()) {
+      throwIfCaptureCancelled(requestId);
+      progress.phase = "reading";
+      progress.pageAssetsDone = 0;
+      progress.pageAssetsTotal = 0;
+      await publishProgress(true);
+      const tabRequestId = `${requestId}_${index}`;
+      try {
+        const thumbnail = await captureTabThumbnail(tab.tabId);
+        const assetsBefore = progress.assetsDone;
+        const assetTotalBefore = progress.assetsTotal;
+        const result = await captureLivePage(tab.tabId, tabRequestId, { runScripts, captureMedia }, (done, total) => {
+          if (progress.phase !== "assets") progress.phase = "assets";
+          progress.assetsDone = assetsBefore + done;
+          progress.assetsTotal = assetTotalBefore + total;
+          progress.pageAssetsDone = done;
+          progress.pageAssetsTotal = total;
+          publishProgress();
+        });
+        throwIfCaptureCancelled(requestId);
+        const page = { ...result.page, bytes: result.bytes, resourceCount: result.resources };
+        const failures = result.failures.map((failure) => ({ ...failure, type: "resource", pageUrl: page.url }));
+        const pack = {
+          id: makePackId(),
+          rootUrl: page.url,
+          title: page.title,
+          savedAt: Date.now(),
+          depth: 0,
+          runScripts: Boolean(runScripts),
+          scope: "site",
+          sortOrder: -1,
+          folderId: folderId || DEFAULT_FOLDER_ID,
+          favicon: page.favicon || null,
+          limits: packLimits,
+          pages: [page],
+          failures,
+          stats: { pages: 1, bytes: result.bytes, resources: result.resources, failed: failures.length },
+        };
+        await putPack(pack);
+        if (thumbnail) await putThumbnail(pack.id, thumbnail).catch(() => {});
+        saved.push({ packId: pack.id, title: pack.title, url: pack.rootUrl });
+        progress.bytesDone += result.bytes;
+      } catch (error) {
+        if (isCaptureCancelled(requestId) || error?.code === "CAPTURE_CANCELLED") throw error;
+        cancelCaptureStream(tabRequestId);
+        failedTabs.push({ url: tab.url, title: tab.title || tab.url, message: captureErrorMessage(error) });
+      }
+      progress.pagesDone = index + 1;
+      setCaptureBadgePages(saved.length);
+    }
+    job.committed = true;
+    progress.phase = "finishing";
+    await publishProgress(true);
+    if (countAgainstQuota && saved.length) await consumeFreePages(saved.length).catch(() => {});
+    await deleteCapture(requestId).catch(() => {});
+    sendPopupMessage({
+      type: "CAPTURE_COMPLETE",
+      requestId,
+      batch: true,
+      saved: saved.length,
+      pages: saved.length,
+      failed: failedTabs.length,
+      failedTabs,
+    });
+  } catch (error) {
+    if ((isCaptureCancelled(requestId) || error?.code === "CAPTURE_CANCELLED") && countAgainstQuota && saved.length) {
+      await consumeFreePages(saved.length).catch(() => {});
+    }
+    error.savedTabs = saved.length;
+    throw error;
   } finally {
     captureJobs.delete(requestId);
     setCaptureBadge(false);
@@ -1579,22 +2142,24 @@ async function prepareCapture(message) {
 
     const monetization = await getMonetizationState({ refresh: true });
     const isPaid = monetization.entitlement.paid;
-    if (!isPaid && monetization.remaining < 1) {
-      throw new Error(`You’ve used all ${PRICING.freePagesPerMonth} free saves this month. Upgrade to Pro to keep saving.`);
-    }
+    if (!isPaid && monetization.remaining < 1) throw new Error(allowanceExhaustedMessage());
     const packLimits = effectivePackLimits(message, isPaid);
 
-    const requestId = `capture_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const requestId = makeRequestId("capture");
+    const tabCount = Array.isArray(message.tabs) ? message.tabs.length : 0;
     const capture = {
       id: requestId,
       state: "queued",
       phase: "queued",
       message: "Starting save…",
       error: null,
-      tabId: message.tabId,
+      tabId: Number.isInteger(message.tabId) ? message.tabId : null,
       pageUrl: message.pageUrl || "",
-      pageTitle: message.pageTitle || "",
+      pageTitle: message.pageTitle || (tabCount ? `${tabCount} tabs` : ""),
       depth: clampDepth(message.depth),
+      batch: tabCount > 0,
+      updatePackId: message.updatePackId || null,
+      pagesTotal: tabCount || (Array.isArray(message.selectedUrls) ? 1 + message.selectedUrls.length : 1),
       ...packLimits,
       startedAt: Date.now(),
       updatedAt: Date.now(),
@@ -1612,6 +2177,140 @@ async function prepareCapture(message) {
     captureStarting = false;
   }
 }
+
+async function settleCaptureFailure(requestId, error, { badge = false, savedTabs = 0 } = {}) {
+  if (isCaptureCancelled(requestId) || error?.code === "CAPTURE_CANCELLED") {
+    await deleteCapture(requestId).catch(() => {});
+    cancelledCaptureIds.delete(requestId);
+    sendPopupMessage({ type: "CAPTURE_CANCELLED", requestId, savedTabs });
+    return;
+  }
+  const messageText = captureErrorMessage(error);
+  await updateCapture(requestId, {
+    state: "failed",
+    phase: "failed",
+    message: messageText,
+    error: messageText,
+  }).catch(() => {});
+  sendPopupMessage({ type: "CAPTURE_ERROR", requestId, message: messageText });
+  if (badge) flashBadgeError(messageText);
+}
+
+/**
+ * Start a save and let it run. Resolves as soon as the save is accepted, with
+ * the request id, so a caller with a popup can show progress; a caller without
+ * one asks for the badge to carry any refusal.
+ */
+async function launchCapture(message, { badge = false } = {}) {
+  const access = await prepareCapture(message);
+  const discovery = message.discoveryId ? takeDiscovery(message.discoveryId) : null;
+  const selected = Array.isArray(message.selectedUrls) ? message.selectedUrls : null;
+  const plan = selected ? selected.filter(isHttpUrl) : discovery ? discovery.pages.map((page) => page.url) : null;
+  const prefetched = discovery && discovery.runScripts === (message.runScripts !== false) ? discovery.prefetched : null;
+  runCapture({ ...message, ...access, plan, prefetched })
+    .catch((error) => settleCaptureFailure(access.requestId, error, { badge }));
+  return access;
+}
+
+async function launchBatch(message) {
+  const tabs = (Array.isArray(message.tabs) ? message.tabs : [])
+    .map((tab) => ({ tabId: Number(tab.tabId), url: String(tab.url || ""), title: String(tab.title || "") }))
+    .filter((tab) => Number.isInteger(tab.tabId) && isHttpUrl(tab.url));
+  if (!tabs.length) throw new Error("None of those tabs can be saved.");
+  const access = await prepareCapture({ ...message, tabs, tabId: null });
+  runBatchCapture({ ...message, ...access, tabs })
+    .catch((error) => settleCaptureFailure(access.requestId, error, { savedTabs: Number(error?.savedTabs) || 0 }));
+  return access;
+}
+
+/**
+ * Re-capture a save in place: same id, same folder, same position, the pages it
+ * holds fetched again. The root comes from the live tab when the caller has one
+ * open on that address; everything else is fetched.
+ */
+async function launchUpdate(message) {
+  const pack = await getPack(String(message.id || ""));
+  if (!pack) throw new Error("That save no longer exists.");
+  const tabId = Number.isInteger(message.tabId) && normalizeUrl(message.tabUrl) === normalizeUrl(pack.rootUrl) ? message.tabId : null;
+  const limits = normalizePackLimits(pack.limits);
+  return launchCapture({
+    tabId,
+    source: tabId === null ? "fetch" : "tab",
+    pageUrl: pack.rootUrl,
+    pageTitle: pack.title,
+    depth: clampDepth(pack.depth),
+    runScripts: pack.runScripts !== false,
+    folderId: pack.folderId,
+    maxPages: limits.maxPages,
+    maxTotalBytes: limits.maxTotalBytes,
+    selectedUrls: (pack.pages || []).slice(1).map((page) => page.url),
+    updatePackId: pack.id,
+  });
+}
+
+/** The active tab, saved as a single page with the remembered preferences. Used by the keyboard shortcut. */
+async function saveActiveTabFromCommand() {
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (!tab || !isHttpUrl(tab.url)) throw new Error("Chrome does not allow extensions to save this page.");
+  const preferences = normalizeCapturePreferences(await getSetting(CAPTURE_PREFERENCES_KEY, DEFAULT_CAPTURE_PREFERENCES));
+  return launchCapture({
+    tabId: tab.id,
+    pageUrl: tab.url,
+    pageTitle: tab.title,
+    depth: 0,
+    runScripts: preferences.runScripts,
+    folderId: preferences.folderId,
+    maxPages: preferences.maxPages,
+    maxTotalBytes: preferences.maxTotalBytes,
+  }, { badge: true });
+}
+
+/** A link, saved as a single page without opening it. Used by the context menu. */
+async function saveLinkFromMenu(url) {
+  const target = normalizeUrl(url);
+  if (!isHttpUrl(target)) throw new Error("That link is not a web page PagePack can save.");
+  const preferences = normalizeCapturePreferences(await getSetting(CAPTURE_PREFERENCES_KEY, DEFAULT_CAPTURE_PREFERENCES));
+  return launchCapture({
+    tabId: null,
+    source: "fetch",
+    pageUrl: target,
+    pageTitle: target,
+    depth: 0,
+    runScripts: preferences.runScripts,
+    folderId: preferences.folderId,
+    maxPages: preferences.maxPages,
+    maxTotalBytes: preferences.maxTotalBytes,
+  }, { badge: true });
+}
+
+function installContextMenu() {
+  try {
+    chrome.contextMenus.removeAll(() => {
+      void chrome.runtime.lastError;
+      chrome.contextMenus.create({
+        id: CONTEXT_MENU_ID,
+        title: "Save link with PagePack",
+        contexts: ["link"],
+        targetUrlPatterns: ["http://*/*", "https://*/*"],
+      }, () => void chrome.runtime.lastError);
+    });
+  } catch {
+    // The menu is a convenience; the popup is always there.
+  }
+}
+
+chrome.runtime.onInstalled.addListener(installContextMenu);
+chrome.runtime.onStartup?.addListener(installContextMenu);
+
+chrome.contextMenus?.onClicked?.addListener((info) => {
+  if (info.menuItemId !== CONTEXT_MENU_ID) return;
+  saveLinkFromMenu(info.linkUrl).catch((error) => flashBadgeError(captureErrorMessage(error)));
+});
+
+chrome.commands?.onCommand?.addListener((command) => {
+  if (command !== SAVE_COMMAND) return;
+  saveActiveTabFromCommand().catch((error) => flashBadgeError(captureErrorMessage(error)));
+});
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "CAPTURE_STREAM_ERROR") {
@@ -1642,6 +2341,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         job.abortController.abort();
       }
       cancelCaptureStream(requestId);
+      for (const streamId of [...captureStreams.keys()]) {
+        if (streamId.startsWith(`${requestId}_`)) cancelCaptureStream(streamId);
+      }
       if (!job) {
         await deleteCapture(requestId).catch(() => {});
         sendPopupMessage({ type: "CAPTURE_CANCELLED", requestId });
@@ -1674,29 +2376,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "START_CAPTURE") {
-    prepareCapture(message)
-      .then((access) => {
-        sendResponse({ accepted: true, requestId: access.requestId });
-        runCapture({ ...message, ...access }).catch(async (error) => {
-          if (isCaptureCancelled(access.requestId) || error?.code === "CAPTURE_CANCELLED") {
-            await deleteCapture(access.requestId).catch(() => {});
-            cancelledCaptureIds.delete(access.requestId);
-            sendPopupMessage({ type: "CAPTURE_CANCELLED", requestId: access.requestId });
-            return;
-          }
-          const messageText = captureErrorMessage(error);
-          await updateCapture(access.requestId, {
-            state: "failed",
-            phase: "failed",
-            message: messageText,
-            error: messageText,
-          }).catch(() => {});
-          sendPopupMessage({ type: "CAPTURE_ERROR", requestId: access.requestId, message: messageText });
-        });
-      })
-      .catch((error) => {
-        sendResponse({ error: captureErrorMessage(error) });
-      });
+    launchCapture(message)
+      .then((access) => sendResponse({ accepted: true, requestId: access.requestId }))
+      .catch((error) => sendResponse({ error: captureErrorMessage(error) }));
+    return true;
+  }
+  if (message?.type === "START_BATCH") {
+    launchBatch(message)
+      .then((access) => sendResponse({ accepted: true, requestId: access.requestId }))
+      .catch((error) => sendResponse({ error: captureErrorMessage(error) }));
+    return true;
+  }
+  if (message?.type === "UPDATE_PACK") {
+    launchUpdate(message)
+      .then((access) => sendResponse({ accepted: true, requestId: access.requestId }))
+      .catch((error) => sendResponse({ error: captureErrorMessage(error) }));
+    return true;
+  }
+  if (message?.type === "SAVE_LINK") {
+    saveLinkFromMenu(message.url)
+      .then((access) => sendResponse({ accepted: true, requestId: access.requestId }))
+      .catch((error) => sendResponse({ error: captureErrorMessage(error) }));
+    return true;
+  }
+  if (message?.type === "DISCOVER_LINKS") {
+    discoverLinkedPages(message)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ error: captureErrorMessage(error) }));
+    return true;
+  }
+  if (message?.type === "FIND_SAVED_URL") {
+    findSavedUrl(String(message.url || ""))
+      .then((match) => sendResponse({ match: match || null }))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+  if (message?.type === "FIND_SAVED_URLS") {
+    findSavedUrls(message.urls)
+      .then((matches) => sendResponse({ matches }))
+      .catch((error) => sendResponse({ error: error.message }));
     return true;
   }
   if (message?.type === "GET_MONETIZATION") {
@@ -1712,8 +2430,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "LIST_LIBRARY") {
-    Promise.all([recoveryReady, listPacks(), listFolders(), listCaptures(), listJourneySummaries()])
-      .then(([, packs, folders, captures, journeys]) => sendResponse({ packs, folders, captures, journeys }))
+    Promise.all([recoveryReady, listPacks(), listFolders(), listCaptures(), listJourneySummaries(), listReadingStates().catch(() => ({}))])
+      .then(([, packs, folders, captures, journeys, reading]) => sendResponse({ packs, folders, captures, journeys, reading }))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+  if (message?.type === "GET_THUMBNAILS") {
+    getThumbnails(message.ids)
+      .then((thumbnails) => sendResponse({ thumbnails }))
+      .catch(() => sendResponse({ thumbnails: {} }));
+    return true;
+  }
+  if (message?.type === "GET_READING_STATE") {
+    getReadingState(String(message.packId || ""))
+      .then((state) => sendResponse({ state }))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+  if (message?.type === "PUT_READING_STATE") {
+    putReadingState(String(message.packId || ""), message.patch || {})
+      .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ error: error.message }));
     return true;
   }

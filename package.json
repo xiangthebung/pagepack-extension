@@ -1,6 +1,6 @@
 {
   "name": "pagepack-extension",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Development manifest for the PagePack test suite. The extension itself ships without dependencies.",
   "type": "module",

@@ -1,6 +1,8 @@
 import { removePackPageFromPack } from "./pack-page.js";
 import { DEFAULT_PACK_LIMITS, normalizePackLimits } from "./monetization.js";
 import { priceLines } from "./pricing.js";
+import { getPack } from "./storage.js";
+import { buildExportDocument, safeFileName } from "./pack-render.js";
 
 const $ = (selector) => document.querySelector(selector);
 const ROOT_FOLDER = "__root__";
@@ -9,13 +11,24 @@ const ACTIVE_CAPTURE_STATES = new Set(["queued", "reading", "saving", "finishing
 const PENDING_PAGE_STATES = new Set(["queued", "saving", "retrying"]);
 const COLLECT_PREVIEW_LIMIT = 8;
 const DEPTH_LABELS = ["Single page", "One level of links", "Two levels of links", "Three levels of links"];
+/* The popup is exactly 400px wide. Anything wider is this document opened as a
+   tab — from the reader's Library button — and it lays out as a page. The same
+   query drives the CSS, so the two cannot disagree. */
+const PAGE_MODE = typeof window.matchMedia === "function" && window.matchMedia("(min-width: 520px)").matches;
+const SORT_KEY = "pagepack-library-sort";
+const FILTER_KEY = "pagepack-library-filter";
+const SORT_MODES = new Set(["manual", "newest", "oldest", "title", "largest"]);
+const FILTER_MODES = new Set(["all", "unread", "multi", "journey", "issues"]);
 
 let activeTab = null;
 let packs = [];
 let folders = [];
 let captures = [];
 let journeys = [];
+let reading = {};
+let thumbnails = {};
 let monetization = null;
+let savedMatch = null;
 let currentFolderId = ROOT_FOLDER;
 let expandedPackId = null;
 let renamingFolderId = null;
@@ -31,8 +44,13 @@ let preferencesReady = false;
 let preferencesWrite = Promise.resolve();
 let issueReport = null;
 let reviewBusy = false;
+let reviewConfig = null;
+let discovering = false;
 let shownFailureId = null;
 let menuRowId = null;
+let sortMode = "manual";
+let filterMode = "all";
+let storageEstimate = null;
 const overlayStack = [];
 
 /* ------------------------------------------------------------------ *
@@ -47,6 +65,19 @@ function sendMessage(message) {
       if (response?.error) return reject(new Error(response.error));
       resolve(response || {});
     });
+  });
+}
+
+function queryTabs(filter) {
+  return new Promise((resolve) => {
+    try {
+      chrome.tabs.query(filter, (tabs) => {
+        void chrome.runtime.lastError;
+        resolve(Array.isArray(tabs) ? tabs : []);
+      });
+    } catch {
+      resolve([]);
+    }
   });
 }
 
@@ -84,6 +115,22 @@ function formatDate(value) {
   }
 }
 
+/** "just now", "5 min ago", "2 h ago", "yesterday", "3 days ago", then a date. */
+function formatRelativeTime(value) {
+  const time = Number(value || 0);
+  if (!time) return "";
+  const elapsed = Math.max(0, Date.now() - time);
+  const minutes = Math.round(elapsed / 60000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.round(hours / 24);
+  if (days === 1) return "yesterday";
+  if (days < 7) return `${days} days ago`;
+  return formatDate(time);
+}
+
 function plural(count, singular, pluralForm = `${singular}s`) {
   return `${count} ${count === 1 ? singular : pluralForm}`;
 }
@@ -106,15 +153,30 @@ function shortUrl(value) {
   }
 }
 
+function canonicalUrl(value) {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    return url.href;
+  } catch {
+    return String(value || "");
+  }
+}
+
 function truncate(value, limit) {
   const text = String(value || "");
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 
+/** The status line of whichever view is showing; the other one is cleared. */
 function setStatus(message, isError = false) {
-  const node = $("#save-status");
-  node.textContent = message || "";
-  node.classList.toggle("is-error", Boolean(isError) && Boolean(message));
+  const libraryShowing = !$("#library-view").hidden;
+  const target = libraryShowing ? $("#library-status") : $("#save-status");
+  const other = libraryShowing ? $("#save-status") : $("#library-status");
+  target.textContent = message || "";
+  target.classList.toggle("is-error", Boolean(isError) && Boolean(message));
+  other.textContent = "";
+  other.classList.remove("is-error");
 }
 
 function setProStatus(message, isError = false) {
@@ -133,6 +195,23 @@ function isSavablePage(url) {
 
 function isOffline() {
   return navigator.onLine === false;
+}
+
+function readPreference(key, allowed, fallback) {
+  try {
+    const value = localStorage.getItem(key);
+    return allowed.has(value) ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writePreference(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // A preference that cannot be kept is not worth an error.
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -159,9 +238,14 @@ function isPaid() {
   return Boolean(monetization?.entitlement?.paid);
 }
 
+/** Free pages left this month; the allowance is counted in pages, not saves. */
 function savesLeft() {
   if (!monetization || isPaid()) return Infinity;
   return Math.max(0, Number(monetization.remaining) || 0);
+}
+
+function selectedDepth() {
+  return Math.max(0, Math.min(MAX_DEPTH, Number($("#depth-select").value) || 0));
 }
 
 function folderById(id) {
@@ -174,10 +258,19 @@ function folderName(id) {
 
 function sortedFolders() {
   return [...folders].sort((a, b) => {
+    if (sortMode === "title") return String(a.name).localeCompare(String(b.name));
     const orderA = Number.isFinite(Number(a.sortOrder)) ? Number(a.sortOrder) : Number(a.createdAt || 0);
     const orderB = Number.isFinite(Number(b.sortOrder)) ? Number(b.sortOrder) : Number(b.createdAt || 0);
     return orderA - orderB || String(a.name).localeCompare(String(b.name));
   });
+}
+
+function packCapturedAt(pack) {
+  return Number(pack?.updatedAt) || Number(pack?.savedAt) || 0;
+}
+
+function isUnread(pack) {
+  return !reading[pack.id];
 }
 
 function packsIn(folderId) {
@@ -194,6 +287,29 @@ function packById(id) {
   return packs.find((pack) => pack.id === id) || null;
 }
 
+function matchesFilter(pack) {
+  if (filterMode === "unread") return isUnread(pack);
+  if (filterMode === "multi") return (Number(pack.stats?.pages) || pack.pages?.length || 1) > 1;
+  if (filterMode === "journey") return pack.captureMode === "journey";
+  if (filterMode === "issues") return (Number(pack.stats?.failed) || 0) > 0;
+  return true;
+}
+
+function applySort(list) {
+  if (sortMode === "manual") return list;
+  const sorted = [...list];
+  if (sortMode === "newest") sorted.sort((a, b) => packCapturedAt(b) - packCapturedAt(a));
+  else if (sortMode === "oldest") sorted.sort((a, b) => packCapturedAt(a) - packCapturedAt(b));
+  else if (sortMode === "title") sorted.sort((a, b) => String(a.title || a.rootUrl).localeCompare(String(b.title || b.rootUrl)));
+  else if (sortMode === "largest") sorted.sort((a, b) => (Number(b.stats?.bytes) || 0) - (Number(a.stats?.bytes) || 0));
+  return sorted;
+}
+
+/** Reordering only means something when the list is in the order you gave it. */
+function canReorder() {
+  return !searchQuery && sortMode === "manual" && filterMode === "all";
+}
+
 /* ------------------------------------------------------------------ *
  * Capture preferences
  * ------------------------------------------------------------------ */
@@ -204,7 +320,7 @@ function preferenceSnapshot() {
     maxTotalBytes: $("#max-bytes-per-pack").value,
   });
   return {
-    depth: Math.max(0, Math.min(MAX_DEPTH, Number($("#depth-select").value) || 0)),
+    depth: selectedDepth(),
     runScripts: $("#run-scripts").checked,
     folderId: $("#save-folder").value || null,
     ...limits,
@@ -321,7 +437,28 @@ function renderTargetCard() {
   mark.textContent = (site[0] || "·").toUpperCase();
 }
 
+/**
+ * "Saved 2 h ago · Open / Save again" when the page in front is already in the
+ * library. Both actions are what they say: Open goes to that copy in the
+ * reader, Save again starts the ordinary save.
+ */
+function renderSavedNotice() {
+  const notice = $("#saved-notice");
+  const match = savedMatch && activeTab && canonicalUrl(activeTab.url) === savedMatch.url ? savedMatch : null;
+  notice.hidden = !match || hasActiveWork();
+  if (!match) return;
+  $("#saved-notice-text").textContent = `Saved ${formatRelativeTime(match.savedAt)}`;
+  $("#saved-open-button").title = match.title ? `Open “${match.title}”` : "Open the saved copy";
+}
+
+/** How far along a save is, from what the worker last reported. */
 function captureProgressRatio(capture) {
+  const pagesTotal = Number(capture.pagesTotal) || 0;
+  if (pagesTotal > 1) {
+    const pageTotal = Number(capture.pageAssetsTotal) || 0;
+    const pageDone = pageTotal ? Math.min(1, (Number(capture.pageAssetsDone) || 0) / pageTotal) : 0;
+    return Math.max(0, Math.min(1, ((Number(capture.pagesDone) || 0) + pageDone) / pagesTotal));
+  }
   const total = Number(capture.assetsTotal) || 0;
   const done = Number(capture.assetsDone) || 0;
   if (!total) return 0;
@@ -347,6 +484,18 @@ function renderProgressCard(capture) {
     $("#progress-fill").style.removeProperty("width");
     bar.removeAttribute("aria-valuenow");
     bar.setAttribute("aria-valuetext", capture.message || "Saving");
+  }
+  // The honest line for a save with a known page count: pages landed so far,
+  // out of the total, and what they weigh on disk.
+  const meter = $("#progress-meter");
+  if (pagesTotal > 1 && !cancelling) {
+    const unit = capture.unit === "tabs" ? "tabs" : "pages";
+    const done = Math.min(Number(capture.pagesDone) || 0, pagesTotal);
+    meter.textContent = `${done} of ${pagesTotal} ${unit} · ${formatBytes(capture.bytesDone)}`;
+    meter.hidden = false;
+  } else {
+    meter.textContent = "";
+    meter.hidden = true;
   }
   const cancel = $("#cancel-save-button");
   cancel.disabled = cancelling;
@@ -420,6 +569,15 @@ function renderCollectPanel(journey) {
   $("#collect-discard-button").disabled = finishing;
 }
 
+/** The line under the Save button: what this press will cost, or what it will do first. */
+function saveHint({ savable, outOfSaves, offline }) {
+  if (!savable || outOfSaves || offline || discovering) return "";
+  if (selectedDepth() > 0) return "Finds the same-site links first, so you see the page count before anything is saved";
+  const remaining = savesLeft();
+  if (!Number.isFinite(remaining)) return "";
+  return `Uses 1 of ${plural(remaining, "free page")} left this month`;
+}
+
 function renderSaveView() {
   renderTargetCard();
   const capture = activeCapture();
@@ -433,21 +591,32 @@ function renderSaveView() {
   $("#collect-panel").hidden = !journey;
   $("#save-action").hidden = Boolean(capture || journey);
   $("#collect-start-button").hidden = Boolean(capture || journey);
+  $("#tabs-start-button").hidden = Boolean(capture || journey);
 
   if (capture) renderProgressCard(capture);
   if (journey) renderCollectPanel(journey);
+  renderSavedNotice();
 
   const saveButton = $("#save-button");
-  saveButton.disabled = Boolean(capture || journey) || offline || !savable || outOfSaves;
-  saveButton.textContent = offline ? "You’re offline" : outOfSaves ? "No free saves left" : "Save page";
+  saveButton.disabled = Boolean(capture || journey) || offline || !savable || outOfSaves || discovering;
+  saveButton.textContent = offline
+    ? "You’re offline"
+    : outOfSaves
+      ? "No free pages left"
+      : discovering
+        ? "Finding linked pages…"
+        : selectedDepth() > 0 ? "Save with linked pages…" : "Save page";
   // A save that finishes before the first refresh must not leave a spinner behind.
-  if (!capture) setBusy(saveButton, false);
+  if (!capture && !discovering) setBusy(saveButton, false);
+  $("#save-hint").textContent = saveHint({ savable, outOfSaves, offline });
   $("#quota-upgrade-button").hidden = !outOfSaves || Boolean(capture || journey);
 
   const collectStart = $("#collect-start-button");
-  collectStart.disabled = offline || !savable || outOfSaves;
+  collectStart.disabled = offline || !savable || outOfSaves || discovering;
+  $("#tabs-start-button").disabled = offline || outOfSaves || discovering;
+  $("#saved-again-button").disabled = saveButton.disabled;
 
-  const inputsDisabled = Boolean(capture || journey);
+  const inputsDisabled = Boolean(capture || journey) || discovering;
   $("#save-folder-trigger").disabled = inputsDisabled;
   $("#depth-select").disabled = inputsDisabled;
   $("#run-scripts").disabled = inputsDisabled;
@@ -455,12 +624,12 @@ function renderSaveView() {
   $("#max-bytes-per-pack").disabled = inputsDisabled || !isPaid();
   if (inputsDisabled) closeFolderMenu();
 
-  if (!capture && !journey) {
+  if (!capture && !journey && !discovering) {
     const failure = failedCapture();
     if (offline) setStatus("You’re offline. Your saved pages are ready in Library.");
     else if (!activeTab) setStatus("Open a page in this tab, then try again.", true);
     else if (!savable) setStatus("Chrome does not allow extensions to save its own pages.", true);
-    else if (outOfSaves) setStatus(`You’ve used all ${monetization?.pricing?.freePagesPerMonth || 25} free saves this month.`, true);
+    else if (outOfSaves) setStatus(`You’ve used all ${monetization?.pricing?.freePagesPerMonth || 25} free pages this month.`, true);
     else if (failure && shownFailureId !== failure.id) {
       // Report an unfinished save once, then let newer messages take the slot.
       shownFailureId = failure.id;
@@ -519,8 +688,9 @@ function renderPlan() {
   hint.textContent = paid ? " plan — manage PagePack Pro" : " plan — view PagePack Pro";
   chip.append(hint);
   chip.classList.toggle("is-pro", paid);
-  summary.textContent = paid ? "Unlimited saves" : `${plural(savesLeft(), "save")} left this month`;
-  summary.title = paid ? "PagePack Pro: unlimited page saves" : `${savesLeft()} of ${freeLimit} free saves left this month`;
+  // The allowance counts pages, not saves: a four-page save takes four of them.
+  summary.textContent = paid ? "Unlimited saves" : `${plural(savesLeft(), "page")} left this month`;
+  summary.title = paid ? "PagePack Pro: unlimited page saves" : `${savesLeft()} of ${freeLimit} free pages left this month. Every page in a save counts as one.`;
 
   $("#pro-title").textContent = paid ? "You’re on Pro" : "Unlimited monthly saves";
   renderProPrice(paid);
@@ -557,8 +727,8 @@ function packMeta(pack) {
   const parts = [];
   if (pages > 1) parts.push(plural(pages, "page"));
   parts.push(formatBytes(stats.bytes));
-  const date = formatDate(pack.savedAt);
-  if (date) parts.push(date);
+  const date = formatDate(packCapturedAt(pack));
+  if (date) parts.push(pack.updatedAt ? `updated ${date}` : date);
   return parts.join(" · ");
 }
 
@@ -572,7 +742,7 @@ function matchesQuery(pack, query) {
   return query.split(/\s+/).filter(Boolean).every((term) => haystack.includes(term));
 }
 
-function makeRow({ kind, id, iconKind, title, meta, issues }) {
+function makeRow({ kind, id, iconKind, title, meta, issues, favicon, thumbnail, unread }) {
   const row = document.createElement("div");
   row.className = `entry ${kind}-entry`;
   row.setAttribute("role", "listitem");
@@ -583,10 +753,10 @@ function makeRow({ kind, id, iconKind, title, meta, issues }) {
   grip.type = "button";
   grip.className = "entry-grip";
   grip.dataset.focusKey = `grip:${kind}:${id}`;
-  if (searchQuery) {
+  if (!canReorder()) {
     grip.disabled = true;
-    grip.title = "Clear the search to reorder";
-    grip.setAttribute("aria-label", `Reordering ${title} is unavailable while searching`);
+    grip.title = searchQuery ? "Clear the search to reorder" : "Switch to “Your order” and “All saves” to reorder";
+    grip.setAttribute("aria-label", `Reordering ${title} is unavailable while the list is sorted or filtered`);
   } else {
     grip.dataset.reorderEnabled = "true";
     grip.title = "Drag to reorder, or press Space and use the arrow keys";
@@ -599,14 +769,40 @@ function makeRow({ kind, id, iconKind, title, meta, issues }) {
   open.className = "entry-open";
   open.dataset.action = kind === "folder" ? `open-folder:${id}` : `open-pack:${id}`;
   open.dataset.focusKey = `open:${kind}:${id}`;
-  const iconNode = document.createElement("span");
-  iconNode.className = "entry-icon";
-  iconNode.append(icon(iconKind));
+  if (thumbnail) {
+    open.classList.add("has-thumb");
+    const picture = document.createElement("img");
+    picture.className = "entry-thumb";
+    picture.src = thumbnail;
+    picture.alt = "";
+    picture.decoding = "async";
+    open.append(picture);
+  } else {
+    const iconNode = document.createElement("span");
+    iconNode.className = "entry-icon";
+    if (favicon) {
+      const image = document.createElement("img");
+      image.src = favicon;
+      image.alt = "";
+      image.decoding = "async";
+      iconNode.append(image);
+    } else {
+      iconNode.append(icon(iconKind));
+    }
+    open.append(iconNode);
+  }
   const copy = document.createElement("span");
   copy.className = "entry-copy";
   const titleNode = document.createElement("span");
   titleNode.className = "entry-title";
-  titleNode.textContent = title;
+  if (unread) {
+    const dot = document.createElement("span");
+    dot.className = "unread-dot";
+    dot.setAttribute("role", "img");
+    dot.setAttribute("aria-label", "Unread");
+    titleNode.append(dot);
+  }
+  titleNode.append(document.createTextNode(title));
   const metaNode = document.createElement("span");
   metaNode.className = "entry-meta";
   metaNode.textContent = meta;
@@ -617,7 +813,7 @@ function makeRow({ kind, id, iconKind, title, meta, issues }) {
     metaNode.append(document.createTextNode(" · "), issueNote);
   }
   copy.append(titleNode, metaNode);
-  open.append(iconNode, copy);
+  open.append(copy);
   open.setAttribute("aria-label", kind === "folder" ? `Open folder ${title}` : `Open ${title}`);
   open.title = title;
 
@@ -671,6 +867,7 @@ function appendPackPages(row, pack) {
   const panel = document.createElement("div");
   panel.className = "pages-panel";
   panel.id = `pages-${pack.id}`;
+  const opened = reading[pack.id]?.opened || {};
   (pack.pages || []).forEach((page, index) => {
     const pageRow = document.createElement("div");
     pageRow.className = "page-row";
@@ -692,7 +889,7 @@ function appendPackPages(row, pack) {
     url.textContent = shortUrl(page.url);
     copy.append(title, url);
     open.append(number, copy);
-    open.title = page.url || "";
+    open.title = `${page.url || ""}${opened[index] ? " · opened" : ""}`;
     pageRow.append(open);
     if (index > 0) {
       const remove = document.createElement("button");
@@ -719,6 +916,41 @@ function setEmptyState(visible, title, help) {
   }
 }
 
+/** The browser's quota is an estimate, so it is shown to the gigabyte, never "~78.14 GB". */
+function roughBytes(bytes) {
+  const amount = Number(bytes || 0);
+  return amount >= 1024 * 1024 * 1024 ? `${Math.round(amount / (1024 * 1024 * 1024))} GB` : formatBytes(amount);
+}
+
+/** "Library: 1.2 GB of ~58 GB available", from the browser's own estimate. */
+function renderStorageLine() {
+  const line = $("#storage-line");
+  const estimate = storageEstimate;
+  const libraryBytes = packs.reduce((total, pack) => total + (Number(pack.stats?.bytes) || 0), 0);
+  if (!packs.length && !estimate) {
+    line.hidden = true;
+    return;
+  }
+  const used = Number(estimate?.usage) || libraryBytes;
+  const quota = Number(estimate?.quota) || 0;
+  $("#storage-text").textContent = quota
+    ? `Library: ${formatBytes(used)} of ~${roughBytes(quota)} available`
+    : `Library: ${formatBytes(used)}`;
+  $("#storage-fill").style.width = quota ? `${Math.max(0.5, Math.min(100, (used / quota) * 100))}%` : "0%";
+  line.hidden = false;
+}
+
+async function refreshStorageEstimate() {
+  try {
+    if (!navigator.storage?.estimate) return;
+    const estimate = await navigator.storage.estimate();
+    storageEstimate = { usage: Number(estimate.usage) || 0, quota: Number(estimate.quota) || 0 };
+    renderStorageLine();
+  } catch {
+    // The library line falls back to the sum of the saves.
+  }
+}
+
 function renderLibrary() {
   const list = $("#library-list");
   closeRowMenu();
@@ -730,21 +962,27 @@ function renderLibrary() {
   $("#library-title").textContent = folder ? folder.name : "Library";
   $("#folder-back-button").hidden = !folder;
   $("#new-folder-button").hidden = Boolean(folder);
+  $("#library-save-tabs-button").hidden = !PAGE_MODE || Boolean(folder) || hasActiveWork();
   $("#library-search").placeholder = folder ? "Search this folder" : "Search titles, sites, and text";
+  $("#library-sort").value = sortMode;
+  $("#library-filter").value = filterMode;
 
   const query = searchQuery;
-  const visiblePacks = packsIn(folder ? folder.id : null).filter((pack) => matchesQuery(pack, query));
-  const visibleFolders = folder
+  const visiblePacks = applySort(packsIn(folder ? folder.id : null)
+    .filter((pack) => matchesQuery(pack, query))
+    .filter(matchesFilter));
+  const visibleFolders = folder || filterMode !== "all"
     ? []
     : sortedFolders().filter((item) => !query || item.name.toLowerCase().includes(query));
 
   $("#library-subtitle").hidden = Boolean(folder) || Boolean(query);
+  renderStorageLine();
   const count = $("#library-count");
   if (query) {
     const total = visiblePacks.length + visibleFolders.length;
     count.textContent = total ? `${plural(total, "match", "matches")}` : "";
     count.hidden = !total;
-  } else if (folder) {
+  } else if (folder || filterMode !== "all") {
     count.textContent = visiblePacks.length ? plural(visiblePacks.length, "saved page") : "";
     count.hidden = !visiblePacks.length;
   } else {
@@ -775,6 +1013,9 @@ function renderLibrary() {
       title: pack.title || shortUrl(pack.rootUrl),
       meta: packMeta(pack),
       issues: Number(pack.stats?.failed) || 0,
+      favicon: typeof pack.favicon === "string" && pack.favicon.startsWith("data:") ? pack.favicon : null,
+      thumbnail: PAGE_MODE ? thumbnails[pack.id] || null : null,
+      unread: isUnread(pack),
     });
     list.append(row);
     if (expandedPackId === pack.id) appendPackPages(row, pack);
@@ -782,6 +1023,7 @@ function renderLibrary() {
 
   const nothing = !visiblePacks.length && !visibleFolders.length;
   if (nothing && query) setEmptyState(true, "No matches", "Try a different word, or clear the search.");
+  else if (nothing && filterMode !== "all") setEmptyState(true, "Nothing here", "Nothing matches this filter. Choose “All saves” to see everything.");
   else if (nothing && folder) setEmptyState(true, "This folder is empty", "Move saves here from any item’s ⋯ menu.");
   else if (nothing) setEmptyState(true, "Nothing saved yet", "Open a page you want to keep, then choose Save.");
   else setEmptyState(false);
@@ -796,6 +1038,21 @@ function renderLibrary() {
         restored.setSelectionRange(selectionStart, selectionStart);
       }
     }
+  }
+}
+
+/** Pictures for the rows on screen, fetched once each. Page mode only. */
+async function loadThumbnails() {
+  if (!PAGE_MODE) return;
+  const wanted = packs.map((pack) => pack.id).filter((id) => !(id in thumbnails));
+  if (!wanted.length) return;
+  wanted.forEach((id) => { thumbnails[id] = null; });
+  try {
+    const { thumbnails: found = {} } = await sendMessage({ type: "GET_THUMBNAILS", ids: wanted });
+    Object.assign(thumbnails, found);
+    if (Object.keys(found).length) renderLibrary();
+  } catch {
+    // A row without a picture shows its icon.
   }
 }
 
@@ -839,6 +1096,13 @@ function menuItemsFor(kind, id) {
     });
   }
   if (issues) items.push({ label: `Review ${plural(issues, "missing part")}`, action: `show-issues:${id}` });
+  items.push({
+    label: "Update",
+    action: `update-pack:${id}`,
+    hint: isPaid() ? "" : plural(pages || 1, "page"),
+    disabled: hasActiveWork() || isOffline(),
+  });
+  items.push({ label: "Export as HTML", action: `export-pack:${id}` });
   if (folders.length) items.push({ label: "Move to…", action: `move-pack:${id}` });
   items.push({ label: "Delete…", action: `delete-pack:${id}`, danger: true });
   return items;
@@ -861,6 +1125,7 @@ function openRowMenu(trigger) {
     button.className = `menu-item${item.danger ? " is-danger" : ""}`;
     button.setAttribute("role", "menuitem");
     button.dataset.action = item.action;
+    button.disabled = Boolean(item.disabled);
     const label = document.createElement("span");
     label.textContent = item.label;
     button.append(label);
@@ -940,10 +1205,12 @@ function trapFocus(event) {
 
 let confirmResolve = null;
 
-function askConfirm({ title, body, confirmLabel = "Delete" }) {
+function askConfirm({ title, body, confirmLabel = "Delete", variant = "danger" }) {
   $("#confirm-title").textContent = title;
   $("#confirm-body").textContent = body;
-  $("#confirm-accept-button").textContent = confirmLabel;
+  const accept = $("#confirm-accept-button");
+  accept.textContent = confirmLabel;
+  accept.classList.toggle("is-neutral", variant !== "danger");
   openOverlay("confirm", "#confirm-cancel-button");
   return new Promise((resolve) => { confirmResolve = resolve; });
 }
@@ -1355,13 +1622,16 @@ function updateDropState(session) {
   if (session.validDrop) placePlaceholder(session);
 }
 
-// The list scrolls inside the view panel, not the window.
+// The list scrolls inside the view panel in the popup, and with the document
+// when this is a page.
 function scroller() {
-  return document.querySelector(".view-panel");
+  return PAGE_MODE ? document.scrollingElement || document.documentElement : document.querySelector(".view-panel");
 }
 
 function scrollSpeedAt(clientY) {
-  const rect = scroller().getBoundingClientRect();
+  const rect = PAGE_MODE
+    ? { top: 0, bottom: window.innerHeight }
+    : scroller().getBoundingClientRect();
   const fromTop = clientY - rect.top;
   const fromBottom = rect.bottom - clientY;
   if (fromTop < AUTO_SCROLL_EDGE) return -AUTO_SCROLL_MAX_SPEED * (1 - Math.max(0, fromTop) / AUTO_SCROLL_EDGE);
@@ -1640,14 +1910,15 @@ async function persistOrder(kind, sourceId, orderedIds, restoreFocus = false) {
 
 function signatureOf() {
   return JSON.stringify([
-    packs.map((pack) => [pack.id, pack.title, pack.folderId, pack.sortOrder, pack.savedAt,
-      pack.stats?.pages, pack.stats?.bytes, pack.stats?.failed, pack.pages?.length]),
+    packs.map((pack) => [pack.id, pack.title, pack.folderId, pack.sortOrder, pack.savedAt, pack.updatedAt,
+      pack.stats?.pages, pack.stats?.bytes, pack.stats?.failed, pack.pages?.length, Boolean(pack.favicon)]),
     folders.map((folder) => [folder.id, folder.name, folder.sortOrder]),
     captures.map((capture) => [capture.id, capture.state, capture.message,
-      capture.pagesDone, capture.pagesTotal, capture.assetsDone, capture.assetsTotal]),
+      capture.pagesDone, capture.pagesTotal, capture.assetsDone, capture.assetsTotal, capture.bytesDone]),
     journeys.map((journey) => [journey.id, journey.state, journey.message, journey.pageCount,
       journey.savedCount, journey.pendingCount, journey.failedCount,
       (journey.pageTitles || []).map((page) => `${page.url}:${page.state}`)]),
+    Object.keys(reading).sort(),
   ]);
 }
 
@@ -1668,6 +1939,7 @@ async function loadLibrary({ force = false } = {}) {
   folders = Array.isArray(result.folders) ? result.folders : [];
   captures = Array.isArray(result.captures) ? result.captures : [];
   journeys = Array.isArray(result.journeys) ? result.journeys : [];
+  reading = result.reading && typeof result.reading === "object" ? result.reading : {};
   const signature = signatureOf();
   if (!force && signature === librarySignature) {
     scheduleRefresh();
@@ -1679,6 +1951,8 @@ async function loadLibrary({ force = false } = {}) {
   renderLibrary();
   renderSaveView();
   scheduleRefresh();
+  loadThumbnails().catch(() => {});
+  refreshStorageEstimate().catch(() => {});
 }
 
 function scheduleRefresh() {
@@ -1709,6 +1983,20 @@ async function refreshPlan(refresh = false, trigger = null) {
   }
 }
 
+/** Whether the page in front is already in the library, and when it was saved. */
+async function checkSavedMatch() {
+  savedMatch = null;
+  if (!activeTab || !isSavablePage(activeTab.url)) return;
+  try {
+    const { match } = await sendMessage({ type: "FIND_SAVED_URL", url: activeTab.url });
+    if (!match) return;
+    const pack = packById(match.packId);
+    savedMatch = { ...match, url: canonicalUrl(activeTab.url), title: pack?.title || "" };
+  } catch {
+    // Without the answer the notice simply does not show.
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * Views
  * ------------------------------------------------------------------ */
@@ -1717,7 +2005,7 @@ function showView(name) {
   if (dragSession?.mode === "keyboard") cancelKeyboardDrag();
   if (dragSession?.mode === "pointer") cancelPointerDrag();
   closeRowMenu();
-  const saveActive = name === "save";
+  const saveActive = name === "save" && !PAGE_MODE;
   $("#save-view").hidden = !saveActive;
   $("#library-view").hidden = saveActive;
   [["#save-tab", saveActive], ["#library-tab", !saveActive]].forEach(([selector, active]) => {
@@ -1733,10 +2021,11 @@ function showView(name) {
  * Actions
  * ------------------------------------------------------------------ */
 
-function openViewer(packId, pageIndex = 0) {
-  const url = chrome.runtime.getURL(`viewer.html?pack=${encodeURIComponent(packId)}&page=${Math.max(0, Number(pageIndex) || 0)}`);
+function openViewer(packId, pageIndex = null) {
+  const page = Number.isInteger(pageIndex) && pageIndex >= 0 ? `&page=${pageIndex}` : "";
+  const url = chrome.runtime.getURL(`viewer.html?pack=${encodeURIComponent(packId)}${page}`);
   chrome.tabs.create({ url });
-  window.close();
+  if (!PAGE_MODE) window.close();
 }
 
 function captureRequest() {
@@ -1768,8 +2057,19 @@ function canStartCapture() {
   return true;
 }
 
-async function savePage() {
-  if (!canStartCapture()) return;
+/** What a save of `count` pages does to the free allowance, in one line. */
+function allowanceNote(count) {
+  const remaining = savesLeft();
+  if (!Number.isFinite(remaining)) return { text: "", warning: false };
+  if (count < remaining) return { text: `Leaves ${plural(remaining - count, "free page")} this month.`, warning: false };
+  if (count === remaining) return { text: "Uses the last of your free pages this month.", warning: true };
+  return {
+    text: `More than the ${plural(remaining, "free page")} you have left this month. The whole save is kept; the next one waits for next month or Pro.`,
+    warning: true,
+  };
+}
+
+async function startCapture(extra = {}) {
   const button = $("#save-button");
   button.disabled = true;
   setBusy(button, true);
@@ -1777,8 +2077,9 @@ async function savePage() {
   try {
     const response = await sendMessage({
       type: "START_CAPTURE",
-      depth: Number($("#depth-select").value) || 0,
+      depth: selectedDepth(),
       ...captureRequest(),
+      ...extra,
     });
     if (!response.accepted) throw new Error("The save did not start.");
     cancelRequestId = null;
@@ -1789,6 +2090,158 @@ async function savePage() {
     reportError(error);
     renderSaveView();
   }
+}
+
+/**
+ * Save at depth ≥ 1 goes through a pre-flight: the same-site links are found
+ * first, shown with a count and an estimated size, and the save only starts
+ * with the pages that are still ticked.
+ */
+async function discoverLinkedPages() {
+  discovering = true;
+  const button = $("#save-button");
+  setBusy(button, true);
+  renderSaveView();
+  setStatus("Looking for linked pages on this site…");
+  let result;
+  try {
+    result = await sendMessage({
+      type: "DISCOVER_LINKS",
+      tabId: activeTab.id,
+      pageUrl: activeTab.url,
+      pageTitle: activeTab.title,
+      depth: selectedDepth(),
+      runScripts: $("#run-scripts").checked,
+      maxPages: Number($("#max-pages-per-pack").value),
+    });
+  } catch (error) {
+    discovering = false;
+    setBusy(button, false);
+    reportError(error);
+    renderSaveView();
+    return;
+  }
+  discovering = false;
+  setBusy(button, false);
+  setStatus("");
+  renderSaveView();
+  if (!result.pages?.length) {
+    setStatus("No same-site links were found on this page, so it will be saved on its own.");
+    await startCapture({ selectedUrls: [] });
+    return;
+  }
+  openPreflightSheet(result);
+}
+
+function openPreflightSheet(result) {
+  const found = 1 + result.pages.length;
+  const estimate = formatBytes(result.estimatedBytes);
+  const rows = [
+    { id: result.rootUrl, title: result.rootTitle || shortUrl(result.rootUrl), note: "This page · always kept", checked: true, locked: true, required: true, bytes: 0 },
+    ...result.pages.map((page) => ({
+      id: page.url,
+      title: page.title && page.title !== page.url ? page.title : shortUrl(page.url),
+      note: page.level > 1 ? `${shortUrl(page.url)} · ${page.level} links away` : shortUrl(page.url),
+      checked: true,
+      bytes: page.estimatedBytes,
+    })),
+  ];
+  const caveats = [];
+  if (result.pageLimitReached) caveats.push("stopped at the per-save page limit");
+  if (result.truncatedPages?.length) caveats.push(`only the first 100 links of ${plural(result.truncatedPages.length, "page")} were followed`);
+  if (result.unreachable) caveats.push(`${plural(result.unreachable, "page")} could not be reached`);
+  openReviewSheet({
+    mode: "preflight",
+    kicker: "LINKED PAGES",
+    title: "Pack this site",
+    summary: `${plural(found, "page")} found · ~${estimate} estimated`,
+    detail: `Uncheck anything you don’t need — this page always stays.${caveats.length ? ` ${caveats.join("; ")}.` : ""}`,
+    rows,
+    confirmLabel: (count) => `Save ${plural(count, "page")}`,
+    busyLabel: "Starting…",
+    cancelLabel: "Cancel",
+    allowance: true,
+    onConfirm: async (selectedIds) => {
+      const selectedUrls = selectedIds.filter((url) => url !== result.rootUrl);
+      closeOverlay("review");
+      await startCapture({ discoveryId: result.discoveryId, selectedUrls });
+    },
+  });
+}
+
+async function savePage() {
+  if (!canStartCapture()) return;
+  if (selectedDepth() > 0) {
+    await discoverLinkedPages();
+    return;
+  }
+  await startCapture();
+}
+
+/**
+ * Every http(s) tab in this window, each as its own save. Tabs already in the
+ * library start unticked and say when they were saved.
+ */
+async function startTabsSave() {
+  if (isOffline()) {
+    setStatus("You’re offline. Your saved pages are ready in Library.");
+    return;
+  }
+  const tabs = (await queryTabs({ currentWindow: true }))
+    .filter((tab) => Number.isInteger(tab.id) && isSavablePage(tab.url));
+  if (!tabs.length) {
+    setStatus("None of the tabs in this window can be saved.", true);
+    return;
+  }
+  let matches = {};
+  try {
+    ({ matches = {} } = await sendMessage({ type: "FIND_SAVED_URLS", urls: tabs.map((tab) => tab.url) }));
+  } catch {
+    matches = {};
+  }
+  const rows = tabs.map((tab) => {
+    const match = matches[canonicalUrl(tab.url)];
+    return {
+      id: String(tab.id),
+      title: tab.title || shortUrl(tab.url),
+      note: match ? `Saved ${formatRelativeTime(match.savedAt)} · ${shortUrl(tab.url)}` : shortUrl(tab.url),
+      checked: !match,
+      tab,
+    };
+  });
+  const alreadySaved = rows.filter((row) => !row.checked).length;
+  openReviewSheet({
+    mode: "tabs",
+    kicker: "THIS WINDOW",
+    title: "Save open tabs",
+    summary: `${plural(tabs.length, "tab")} open in this window${alreadySaved ? ` · ${alreadySaved} already saved` : ""}`,
+    detail: "Each tab becomes its own save. Uncheck any you don’t need.",
+    rows,
+    confirmLabel: (count) => `Save ${plural(count, "tab")}`,
+    busyLabel: "Starting…",
+    cancelLabel: "Cancel",
+    allowance: true,
+    onConfirm: async (selectedIds) => {
+      const chosen = rows.filter((row) => selectedIds.includes(row.id)).map((row) => ({ tabId: row.tab.id, url: row.tab.url, title: row.tab.title }));
+      const response = await sendMessage({
+        type: "START_BATCH",
+        tabs: chosen,
+        runScripts: $("#run-scripts").checked,
+        folderId: $("#save-folder").value || null,
+        maxPages: Number($("#max-pages-per-pack").value),
+        maxTotalBytes: Number($("#max-bytes-per-pack").value),
+      });
+      if (!response.accepted) throw new Error("The save did not start.");
+      cancelRequestId = null;
+      closeOverlay("review");
+      if (PAGE_MODE) setStatus(`Saving ${plural(chosen.length, "tab")}… Progress shows on the toolbar icon.`);
+      else {
+        showView("save");
+        setStatus("");
+      }
+      await loadLibrary({ force: true });
+    },
+  });
 }
 
 async function startCollecting() {
@@ -1824,47 +2277,68 @@ async function cancelSave() {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * The review sheet: collections, linked pages, open tabs
+ * ------------------------------------------------------------------ */
+
 function keepablePages(journey) {
   return (journey.pageTitles || []).filter((page) => page.state !== "failed");
 }
 
-function openReviewSheet(journey) {
-  const pages = journey.pageTitles || [];
-  const pending = pages.filter((page) => PENDING_PAGE_STATES.has(page.state)).length;
-  const failed = pages.filter((page) => page.state === "failed").length;
-  const details = [
-    pending ? `${pending} still saving` : null,
-    failed ? `${failed} couldn’t be saved` : null,
-  ].filter(Boolean);
-  $("#review-summary").textContent = `${plural(pages.length, "page")} collected${details.length ? ` · ${details.join(" · ")}` : ""}. Uncheck anything you don’t need — the first page always stays.`;
+function selectedReviewIds() {
+  return [...$("#review-list").querySelectorAll("input[data-row-id]")]
+    .filter((input) => input.checked)
+    .map((input) => input.dataset.rowId);
+}
+
+function updateReviewCount() {
+  if (!reviewConfig) return;
+  const inputs = [...$("#review-list").querySelectorAll("input[data-row-id]")];
+  const selected = inputs.filter((input) => input.checked);
+  const count = selected.length;
+  const save = $("#save-reviewed-button");
+  save.textContent = reviewBusy ? reviewConfig.busyLabel : reviewConfig.confirmLabel(count);
+  save.disabled = reviewBusy || count === 0;
+  const note = $("#review-note");
+  // Nothing ticked costs nothing, so there is nothing to say about the allowance.
+  if (reviewConfig.allowance && count > 0) {
+    const { text, warning } = allowanceNote(count);
+    note.textContent = text;
+    note.hidden = !text;
+    note.classList.toggle("is-warning", warning);
+  } else {
+    note.textContent = "";
+    note.hidden = true;
+  }
+}
+
+function openReviewSheet(config) {
+  reviewConfig = config;
+  $("#review-kicker").textContent = config.kicker;
+  $("#review-title").textContent = config.title;
+  $("#review-summary").textContent = `${config.summary}${config.detail ? `. ${config.detail}` : ""}`;
+  $("#keep-browsing-button").textContent = config.cancelLabel || "Cancel";
+  $("#close-review-button").setAttribute("aria-label", config.cancelLabel || "Cancel");
   const list = $("#review-list");
-  list.replaceChildren(...pages.map((page, index) => {
+  list.replaceChildren(...config.rows.map((item) => {
     const row = document.createElement("label");
     row.className = "review-row";
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
-    checkbox.checked = page.state !== "failed";
-    checkbox.dataset.pageUrl = page.url || "";
-    const first = index === 0;
-    const failedPage = page.state === "failed";
-    // The first page anchors the collection and failed pages hold nothing, so
-    // both stay locked even after the sheet leaves its busy state.
-    checkbox.disabled = first || failedPage;
+    checkbox.checked = Boolean(item.checked);
+    checkbox.dataset.rowId = item.id;
+    checkbox.disabled = Boolean(item.locked);
     if (checkbox.disabled) checkbox.dataset.locked = "true";
-    if (first) row.classList.add("is-required");
-    if (failedPage) row.classList.add("is-disabled");
+    if (item.required) row.classList.add("is-required");
+    if (item.disabled) row.classList.add("is-disabled");
     const copy = document.createElement("span");
     copy.className = "review-copy";
     const title = document.createElement("span");
     title.className = "review-title";
-    title.textContent = page.title || shortUrl(page.url) || "Saved page";
+    title.textContent = item.title;
     const note = document.createElement("span");
-    note.className = "review-note";
-    note.textContent = failedPage
-      ? "Couldn’t be saved"
-      : first
-        ? "First page · always kept"
-        : PENDING_PAGE_STATES.has(page.state) ? "Still saving" : shortUrl(page.url);
+    note.className = "review-note-line review-note";
+    note.textContent = item.note || "";
     copy.append(title, note);
     row.append(checkbox, copy);
     return row;
@@ -1882,8 +2356,52 @@ function setReviewBusy(busy) {
     control.disabled = busy || control.dataset.locked === "true";
   });
   const save = $("#save-reviewed-button");
-  save.textContent = busy ? "Saving…" : "Save selected pages";
   setBusy(save, busy);
+  updateReviewCount();
+}
+
+function openJourneyReview(journey) {
+  const pages = journey.pageTitles || [];
+  const pending = pages.filter((page) => PENDING_PAGE_STATES.has(page.state)).length;
+  const failed = pages.filter((page) => page.state === "failed").length;
+  const details = [
+    pending ? `${pending} still saving` : null,
+    failed ? `${failed} couldn’t be saved` : null,
+  ].filter(Boolean);
+  openReviewSheet({
+    mode: "journey",
+    kicker: "BEFORE SAVING",
+    title: "Choose what to keep",
+    summary: `${plural(pages.length, "page")} collected${details.length ? ` · ${details.join(" · ")}` : ""}`,
+    detail: "Uncheck anything you don’t need — the first page always stays.",
+    rows: pages.map((page, index) => {
+      const first = index === 0;
+      const failedPage = page.state === "failed";
+      return {
+        id: page.url || `page-${index}`,
+        title: page.title || shortUrl(page.url) || "Saved page",
+        note: failedPage
+          ? "Couldn’t be saved"
+          : first
+            ? "First page · always kept"
+            : PENDING_PAGE_STATES.has(page.state) ? "Still saving" : shortUrl(page.url),
+        checked: !failedPage,
+        // The first page anchors the collection and failed pages hold nothing, so
+        // both stay locked even after the sheet leaves its busy state.
+        locked: first || failedPage,
+        required: first,
+        disabled: failedPage,
+      };
+    }),
+    confirmLabel: (count) => `Save ${plural(count, "page")}`,
+    busyLabel: "Saving…",
+    cancelLabel: "Keep browsing",
+    allowance: false,
+    onConfirm: async (selectedIds) => {
+      const excludedUrls = pages.map((page) => page.url).filter((url, index) => index > 0 && url && !selectedIds.includes(url));
+      await saveCollection(excludedUrls);
+    },
+  });
 }
 
 function finishCollecting() {
@@ -1898,7 +2416,7 @@ function finishCollecting() {
     saveCollection([]).catch(reportError);
     return;
   }
-  openReviewSheet(journey);
+  openJourneyReview(journey);
 }
 
 async function saveCollection(excludedUrls) {
@@ -1922,12 +2440,19 @@ async function saveCollection(excludedUrls) {
   }
 }
 
-function saveReviewedCollection() {
-  if (reviewBusy) return;
-  const excludedUrls = [...$("#review-list").querySelectorAll("input:not(:checked):not(:disabled)")]
-    .map((input) => input.dataset.pageUrl)
-    .filter(Boolean);
-  saveCollection(excludedUrls).catch(reportError);
+async function confirmReview() {
+  if (!reviewConfig || reviewBusy) return;
+  const config = reviewConfig;
+  const selected = selectedReviewIds();
+  if (!selected.length) return;
+  setReviewBusy(true);
+  try {
+    await config.onConfirm(selected);
+  } catch (error) {
+    reportError(error);
+  } finally {
+    if (reviewConfig === config) setReviewBusy(false);
+  }
 }
 
 async function discardCollection() {
@@ -1947,6 +2472,10 @@ async function discardCollection() {
     reportError(error);
   }
 }
+
+/* ------------------------------------------------------------------ *
+ * Library actions
+ * ------------------------------------------------------------------ */
 
 async function createFolder(event) {
   event.preventDefault();
@@ -2090,6 +2619,64 @@ async function removeCapturedPage(packId, pageIndex) {
   }
 }
 
+/**
+ * Re-capture a save where it is. The pack keeps its id, its folder and its
+ * position; only its pages are fetched again.
+ */
+async function updatePack(id) {
+  const pack = packById(id);
+  if (!pack || hasActiveWork()) return;
+  if (isOffline()) {
+    setStatus("You’re offline, so this save cannot be updated right now.", true);
+    return;
+  }
+  const title = pack.title || shortUrl(pack.rootUrl);
+  const pages = pack.pages?.length || 1;
+  const confirmed = await askConfirm({
+    title: "Update this save?",
+    body: `“${truncate(title, 60)}” will be captured again from the live site, replacing the saved copy.${isPaid() ? "" : ` Uses ${plural(pages, "page")} of your free allowance.`}`,
+    confirmLabel: "Update",
+    variant: "neutral",
+  });
+  if (!confirmed) return;
+  try {
+    const response = await sendMessage({ type: "UPDATE_PACK", id, tabId: activeTab?.id, tabUrl: activeTab?.url });
+    if (!response.accepted) throw new Error("The update did not start.");
+    cancelRequestId = null;
+    if (!PAGE_MODE) showView("save");
+    setStatus(`Updating “${truncate(title, 40)}”…`);
+    await loadLibrary({ force: true });
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+/** One self-contained HTML file for the whole save, written by the browser's own download. */
+async function exportPack(id) {
+  const summary = packById(id);
+  if (!summary) return;
+  const title = summary.title || shortUrl(summary.rootUrl);
+  setStatus(`Preparing “${truncate(title, 40)}” for export…`);
+  try {
+    const pack = await getPack(id);
+    if (!pack) throw new Error("That save could not be read from storage.");
+    const html = buildExportDocument(pack);
+    const blob = new Blob([html], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = safeFileName(title);
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    setStatus(`Exported “${truncate(title, 40)}” as a single HTML file (${formatBytes(blob.size)}).`);
+  } catch (error) {
+    reportError(error);
+  }
+}
+
 async function handleAction(action) {
   const [kind, ...rest] = action.split(":");
   const id = rest.join(":");
@@ -2120,6 +2707,14 @@ async function handleAction(action) {
   if (kind === "show-issues") {
     closeRowMenu();
     return openIssueReport(id);
+  }
+  if (kind === "update-pack") {
+    closeRowMenu();
+    return updatePack(id);
+  }
+  if (kind === "export-pack") {
+    closeRowMenu();
+    return exportPack(id);
   }
   if (kind === "move-pack") {
     closeRowMenu();
@@ -2190,7 +2785,7 @@ chrome.runtime.onMessage.addListener((message) => {
       loadLibrary({ force: true }).catch(() => {});
       return;
     }
-    ["phase", "message", "pagesDone", "pagesTotal", "assetsDone", "assetsTotal", "determinate"]
+    ["phase", "message", "pagesDone", "pagesTotal", "assetsDone", "assetsTotal", "pageAssetsDone", "pageAssetsTotal", "bytesDone", "determinate", "unit"]
       .forEach((field) => { if (field in message) capture[field] = message[field]; });
     librarySignature = "";
     renderSaveView();
@@ -2198,7 +2793,22 @@ chrome.runtime.onMessage.addListener((message) => {
   }
   if (type === "CAPTURE_COMPLETE") {
     cancelRequestId = null;
-    Promise.all([loadLibrary({ force: true }), refreshPlan(false)]).then(() => {
+    Promise.all([loadLibrary({ force: true }), refreshPlan(false), checkSavedMatch()]).then(() => {
+      renderSaveView();
+      if (message.batch) {
+        const failed = Array.isArray(message.failedTabs) ? message.failedTabs : [];
+        const names = failed.map((tab) => `“${truncate(tab.title || shortUrl(tab.url), 40)}”`).join(", ");
+        setStatus(failed.length
+          ? `Saved ${plural(Number(message.saved) || 0, "tab")}. ${plural(failed.length, "tab")} couldn’t be saved: ${names}.`
+          : `Saved ${plural(Number(message.saved) || 0, "tab")} to your library.`, failed.length > 0);
+        return;
+      }
+      if (message.updated) {
+        setStatus(Number(message.failed) > 0
+          ? `Updated. ${plural(Number(message.failed), "part")} could not be captured — see the ⋯ menu in Library.`
+          : "Updated in your library.");
+        return;
+      }
       setStatus(Number(message.failed) > 0
         ? `Saved. ${plural(Number(message.failed), "part")} could not be captured — see the ⋯ menu in Library.`
         : "Saved to your library.");
@@ -2212,7 +2822,8 @@ chrome.runtime.onMessage.addListener((message) => {
   }
   if (type === "CAPTURE_CANCELLED") {
     cancelRequestId = null;
-    setStatus("Save cancelled. Nothing was added.");
+    const kept = Number(message.savedTabs) || 0;
+    setStatus(kept ? `Cancelled. ${plural(kept, "tab")} already saved were kept.` : "Save cancelled. Nothing was added.");
     loadLibrary({ force: true }).catch(() => {});
     return;
   }
@@ -2291,11 +2902,18 @@ async function openProPage(mode, trigger) {
 }
 
 $("#save-button").addEventListener("click", () => savePage().catch(reportError));
+$("#saved-again-button").addEventListener("click", () => savePage().catch(reportError));
+$("#saved-open-button").addEventListener("click", () => {
+  if (savedMatch) openViewer(savedMatch.packId, Number(savedMatch.pageIndex) || 0);
+});
 $("#collect-start-button").addEventListener("click", () => startCollecting().catch(reportError));
+$("#tabs-start-button").addEventListener("click", () => startTabsSave().catch(reportError));
+$("#library-save-tabs-button").addEventListener("click", () => startTabsSave().catch(reportError));
 $("#collect-finish-button").addEventListener("click", finishCollecting);
 $("#collect-discard-button").addEventListener("click", () => discardCollection().catch(reportError));
 $("#cancel-save-button").addEventListener("click", () => cancelSave().catch(reportError));
-$("#save-reviewed-button").addEventListener("click", saveReviewedCollection);
+$("#save-reviewed-button").addEventListener("click", () => confirmReview().catch(reportError));
+$("#review-list").addEventListener("change", updateReviewCount);
 
 $("#issues-list").addEventListener("click", (event) => {
   const node = event.target.closest("[data-issue-action]");
@@ -2345,6 +2963,7 @@ $("#save-folder-menu").addEventListener("keydown", (event) => {
 
 $("#depth-select").addEventListener("change", () => {
   renderOptionsSummary();
+  renderSaveView();
   persistPreferences();
 });
 $("#run-scripts").addEventListener("change", () => {
@@ -2353,6 +2972,17 @@ $("#run-scripts").addEventListener("change", () => {
 });
 $("#max-pages-per-pack").addEventListener("change", persistPreferences);
 $("#max-bytes-per-pack").addEventListener("change", persistPreferences);
+
+$("#library-sort").addEventListener("change", () => {
+  sortMode = SORT_MODES.has($("#library-sort").value) ? $("#library-sort").value : "manual";
+  writePreference(SORT_KEY, sortMode);
+  renderLibrary();
+});
+$("#library-filter").addEventListener("change", () => {
+  filterMode = FILTER_MODES.has($("#library-filter").value) ? $("#library-filter").value : "all";
+  writePreference(FILTER_KEY, filterMode);
+  renderLibrary();
+});
 
 $("#folder-back-button").addEventListener("click", () => {
   currentFolderId = ROOT_FOLDER;
@@ -2415,7 +3045,7 @@ document.addEventListener("pointercancel", (event) => {
 
 $("#row-menu").addEventListener("click", (event) => {
   const item = event.target.closest("[data-action]");
-  if (item) handleAction(item.dataset.action).catch(reportError);
+  if (item && !item.disabled) handleAction(item.dataset.action).catch(reportError);
 });
 $("#row-menu").addEventListener("keydown", (event) => {
   const items = [...$("#row-menu").querySelectorAll(".menu-item")];
@@ -2471,15 +3101,19 @@ function readActiveTab() {
 }
 
 async function start() {
+  sortMode = readPreference(SORT_KEY, SORT_MODES, "manual");
+  filterMode = readPreference(FILTER_KEY, FILTER_MODES, "all");
+  if (PAGE_MODE) document.documentElement.classList.add("is-page");
   await loadPreferences();
   await Promise.all([
     readActiveTab(),
     loadLibrary({ force: true }),
     isOffline() ? Promise.resolve() : refreshPlan(true),
   ]);
+  await checkSavedMatch();
   renderPlan();
   renderSaveView();
-  if (location.hash === "#library" || isOffline()) showView("library");
+  if (PAGE_MODE || location.hash === "#library" || isOffline()) showView("library");
   else showView("save");
   if (location.hash === "#pro") openOverlay("pro", "#close-pro-button");
   if (isOffline()) setStatus("You’re offline. Your saved pages are ready in Library.");

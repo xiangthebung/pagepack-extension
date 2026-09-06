@@ -6,7 +6,7 @@ PagePack Pro is sold by the PagePack developer, not by Google. Checkout and bill
 
 ## Plans
 
-PagePack Pro is offered at **CAD $1.99 per month** or **CAD $9.99 per year**, unless checkout clearly shows a different price, currency, tax, discount, or billing interval before purchase. Subscriptions renew automatically until canceled. Pro removes the 25-page monthly free allowance and unlocks optional higher per-save limits under Options: up to 1,000 pages or 4 GiB in one save. The defaults are 250 pages and 1 GiB for all users.
+PagePack Pro is offered at **CAD $1.99 per month** or **CAD $9.99 per year**, unless checkout clearly shows a different price, currency, tax, discount, or billing interval before purchase. Subscriptions renew automatically until canceled. Pro removes the 25-page monthly free allowance and unlocks optional higher per-save limits under Options: up to 1,000 pages or 4 GiB in one save. The defaults are 250 pages and 1 GiB for all users. The free allowance counts pages captured, including the pages of a save that is updated.
 
 ## Cancellation
 

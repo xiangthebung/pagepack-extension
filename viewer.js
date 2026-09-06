@@ -1,9 +1,29 @@
-import { findSavedUrl, getPack } from "./storage.js";
+import { findSavedUrl, getPack, getReadingState, putReadingState } from "./storage.js";
 import { stripNetworkElements } from "./url-surface.js";
+import {
+  annotateSavedLinks,
+  dataUrlToBlob,
+  pageBytes,
+  pageIndexForUrl as packPageIndexForUrl,
+  prependToHead,
+  resourceMapFor,
+  savedLinkStyle,
+  stripModuleScripts,
+  stripPageScripts,
+  stripUnresolvedStylesheets,
+} from "./pack-render.js";
 
 const $ = (selector) => document.querySelector(selector);
 const CHUNK_SIZE = 4 * 1024 * 1024;
-const RENDER_TIMEOUT = 3500;
+/* The deadline for a render scales with the page. A fixed 3.5 s used to refuse
+   any page over about 25 MB — the save had worked, the reader just gave up on
+   it — and "Try again" reloaded into the same refusal. The markup no longer
+   carries the resource bytes, so most of the time now goes to decoding them
+   into Blobs, which is linear in size: a base plus a per-megabyte allowance is
+   generous for a page that is fine and still finite for one that is not. */
+const BASE_RENDER_TIMEOUT = 4000;
+const RENDER_TIMEOUT_PER_MB = 400;
+const MAX_RENDER_TIMEOUT = 60000;
 /* No `allow-popups`.
    A saved page's own scripts could call `window.open("https://…")` and, with
    `allow-popups-to-escape-sandbox`, land the user on the live site in a new tab
@@ -12,6 +32,9 @@ const RENDER_TIMEOUT = 3500;
    the frame. */
 const FRAME_SANDBOX = "allow-forms allow-scripts";
 const LEGEND_TIMEOUT = 7000;
+const SIDEBAR_KEY = "pagepack-reader-sidebar";
+const SCROLL_SAVE_DELAY = 800;
+const DEFAULT_FAVICON = "icons/icon-32.png";
 
 let pack = null;
 let currentPageIndex = 0;
@@ -24,6 +47,10 @@ let frameTimer = null;
 let renderAttempt = 0;
 let legendTimer = null;
 let unsavedLinkHref = "";
+let readingState = null;
+let sidebarOpen = true;
+let scrollSaveTimer = 0;
+const blobCache = new Map();
 
 function showError(error) {
   window.PagePackViewer?.showError(error);
@@ -58,6 +85,13 @@ function shortReaderUrl(value) {
   }
 }
 
+function formatReaderBytes(bytes) {
+  const amount = Number(bytes || 0);
+  if (amount < 1024 * 1024) return `${Math.max(1, Math.round(amount / 1024))} KB`;
+  if (amount < 1024 * 1024 * 1024) return `${(amount / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(amount / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 function announceMode(message) {
   const node = $("#reader-mode-status");
   if (node) node.textContent = message || "";
@@ -67,33 +101,14 @@ function currentPage() {
   return pack?.pages?.[currentPageIndex] || null;
 }
 
+function renderDeadline(page) {
+  const megabytes = Math.ceil(pageBytes(page) / (1024 * 1024));
+  return Math.min(MAX_RENDER_TIMEOUT, BASE_RENDER_TIMEOUT + megabytes * RENDER_TIMEOUT_PER_MB);
+}
+
 /* ------------------------------------------------------------------ *
  * Markup preparation
  * ------------------------------------------------------------------ */
-
-function resourceMapFor(page) {
-  if (page.resourceMap && typeof page.resourceMap === "object") return page.resourceMap;
-  const source = page.resources || pack?.resources || {};
-  if (!Array.isArray(source)) return source;
-  return Object.fromEntries(source.map((resource) => [resource.token, resource.dataUrl || resource.data || resource.value || ""]));
-}
-
-function stripPageScripts(markup) {
-  return String(markup || "")
-    .replace(/<script\b[\s\S]*?<\/script\s*>/gi, "")
-    .replace(/\s(on[a-z][\w:-]*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
-}
-
-function stripModuleScripts(markup) {
-  // Captured module files are stored as data URLs. Relative imports from a data
-  // URL have no hierarchical base, so running them only creates noisy errors
-  // and cannot reproduce the original module graph offline.
-  return String(markup || "").replace(/<script\b(?=[^>]*\btype\s*=\s*(?:"module"|'module'|module\b))[^>]*>[\s\S]*?<\/script\s*>/gi, "");
-}
-
-function stripUnresolvedStylesheets(markup) {
-  return String(markup || "").replace(/<link\b(?=[^>]*\brel\s*=\s*(?:"[^"]*stylesheet[^"]*"|'[^']*stylesheet[^']*'|[^\s>]*stylesheet[^\s>]*))(?=[^>]*\bhref\s*=\s*(?:"https?:[^"]*"|'https?:[^']*'|https?:[^\s>]+))[^>]*>/gi, "");
-}
 
 function packHasSavedScripts() {
   if (pack?.runScripts === false) return false;
@@ -102,58 +117,23 @@ function packHasSavedScripts() {
     || Object.values(page.resourceMap || {}).some((value) => /^data:(?:text|application)\/javascript/i.test(String(value || ""))));
 }
 
-function canonicalViewerUrl(value, baseUrl) {
-  try {
-    const url = new URL(value, baseUrl);
-    if (!/^https?:$/i.test(url.protocol)) return "";
-    url.hash = "";
-    return url.href;
-  } catch {
-    return "";
-  }
-}
-
-function annotateSavedLinks(markup, pageUrl) {
-  const savedUrls = new Set((pack?.pages || []).map((page) => canonicalViewerUrl(page.url, pageUrl)).filter(Boolean));
-  const currentUrl = canonicalViewerUrl(pageUrl, pageUrl);
-  if (savedUrls.size < 2) return markup;
-  return String(markup || "").replace(/<a\b([^>]*)>/gi, (full, attributes) => {
-    const hrefMatch = attributes.match(/\bhref\s*=\s*(["'])(.*?)\1/i);
-    if (!hrefMatch || hrefMatch[2].trim().startsWith("#")) return full;
-    const targetUrl = canonicalViewerUrl(hrefMatch[2].trim(), pageUrl);
-    if (!targetUrl || targetUrl === currentUrl || !savedUrls.has(targetUrl) || /\bdata-pagepack-saved-link\s*=/i.test(attributes)) return full;
-    const title = /\btitle\s*=/i.test(attributes) ? "" : ' title="Saved in this pack"';
-    return `<a${attributes} data-pagepack-saved-link="true"${title}>`;
-  });
-}
-
-function savedLinkStyle() {
-  return '<style data-pagepack-link-marker>'
-    + 'a[data-pagepack-saved-link="true"]{text-decoration-line:underline!important;text-decoration-style:solid!important;'
-    + 'text-decoration-thickness:2px!important;text-decoration-color:#007aff!important;text-underline-offset:3px;}'
-    + 'a[data-pagepack-saved-link="true"]::after{content:"\\2713 Saved";display:inline-block;margin-left:.38em;'
-    + 'padding:.1em .34em;border:1px solid rgba(0,122,255,.5);border-radius:999px;background:rgba(0,122,255,.12);'
-    + 'color:#007aff;font-size:.62em;font-weight:800;line-height:1.25;letter-spacing:.02em;text-decoration:none;'
-    + 'vertical-align:.12em;white-space:nowrap;}'
-    + '</style>';
-}
-
+/**
+ * The markup handed to the sandbox: scripts stripped or kept, the pack's link
+ * badges added, and every resource still a token. The sandbox resolves the
+ * tokens after parsing, against Blobs sent separately, so this string stays
+ * the size of the page's HTML however many megabytes of images it carries.
+ */
 function hydrateMarkup(page, { runScripts = true } = {}) {
   let markup = String(page.html || "");
-  // Strip script tags before expanding resource tokens so the static fallback
-  // never copies tens of megabytes of script data into the markup.
   if (!runScripts) markup = stripPageScripts(markup);
   else markup = stripModuleScripts(markup);
-  for (const [token, dataUrl] of Object.entries(resourceMapFor(page))) {
-    markup = markup.split(token).join(dataUrl || "");
-  }
   if (!runScripts) markup = stripUnresolvedStylesheets(markup);
   // Packs saved before the capture paths learned to remove these still contain
   // them, and a `<meta http-equiv="refresh">` in an old pack would navigate this
   // frame onto the live site the moment it opened. The reader cannot re-capture
   // an old pack, so it strips them at read time instead.
   markup = stripNetworkElements(markup);
-  markup = annotateSavedLinks(markup, page.url);
+  markup = annotateSavedLinks(markup, pack, page.url);
   /* No `<base>`.
      The reader used to inject `<base href="<the original page URL>">` so that
      relative links resolved. It also silently re-pointed every relative URL that
@@ -162,9 +142,8 @@ function hydrateMarkup(page, { runScripts = true } = {}) {
      missed relative URL resolves against the sandbox's own opaque origin and
      fails locally, which is the correct way for a capture bug to show up.
      Link resolution does not need the document base: the page URL is handed to
-     the bridge below as a literal, and `annotateSavedLinks` already resolves
-     against it explicitly. */
-  const head = savedLinkStyle();
+     the sandbox with the markup, and the sandbox's own bridge resolves clicked
+     links against it. */
   const storageShield = `<script>(function(){
     function memoryStorage(){
       var values = Object.create(null);
@@ -173,49 +152,20 @@ function hydrateMarkup(page, { runScripts = true } = {}) {
     try { Object.defineProperty(window, 'localStorage', { configurable:true, value:memoryStorage() }); } catch (_) {}
     try { Object.defineProperty(window, 'sessionStorage', { configurable:true, value:memoryStorage() }); } catch (_) {}
   }());<\/script>`;
-  const prelude = `${head}${runScripts ? storageShield : ""}`;
-  if (/<head\b[^>]*>/i.test(markup)) markup = markup.replace(/<head\b[^>]*>/i, (match) => `${match}${prelude}`);
-  else markup = `${prelude}${markup}`;
-  /* The bridge that reports clicks and submissions back to the reader.
-     PAGE_URL is the page's own address, for resolving relative links now that no
-     base element is injected; JSON-encoded so a URL containing a quote cannot end
-     the string.
+  return prependToHead(markup, `${savedLinkStyle()}${runScripts ? storageShield : ""}`);
+}
 
-     Links opening in a new tab are intercepted like every other link. They used
-     to be waved through, so a link the save did not include opened the live page
-     with no warning, instead of the "that page isn't in this save" notice every
-     other link gets. The reader decides what opens online; the saved page does
-     not.
-
-     Nothing inside this template literal may contain a backtick. One in a comment
-     ends the string, and the file then fails to parse — which is a broken reader
-     and a passing unit test, because the tests that exercise this bridge rebuild
-     it rather than importing it. `tests/extension-loads.test.mjs` is what catches
-     it, by loading the built extension in a real browser. */
-  const bridge = `<script>(function(){
-    var PAGE_URL = ${JSON.stringify(String(page.url || ""))};
-    document.addEventListener('click', function(event){
-      if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-      var target = event.target && event.target.nodeType === 1 ? event.target : event.target && event.target.parentElement;
-      var link = target && target.closest ? target.closest('a[href]') : null;
-      if (!link) return;
-      var href = link.getAttribute('href');
-      if (!href || href.charAt(0) === '#') return;
-      event.preventDefault();
-      try {
-        parent.postMessage({source:'pagepack-saved-page', type:'link', href:new URL(href, PAGE_URL).href}, '*');
-      } catch (_) {}
-    }, true);
-    document.addEventListener('submit', function(event){
-      var form = event.target;
-      if (!form || !form.action) return;
-      event.preventDefault();
-      parent.postMessage({source:'pagepack-saved-page', type:'form', action:form.getAttribute('action') || form.action}, '*');
-    }, true);
-  }());<\/script>`;
-  if (/<\/head>/i.test(markup)) return markup.replace(/<\/head>/i, `${bridge}</head>`);
-  if (/<\/body>/i.test(markup)) return markup.replace(/<\/body>/i, `${bridge}</body>`);
-  return `${markup}${bridge}`;
+/** The page's resources as Blobs, decoded once and kept for the session. */
+function resourceBlobsFor(index) {
+  if (blobCache.has(index)) return blobCache.get(index);
+  const page = pack.pages[index];
+  const blobs = {};
+  for (const [token, value] of Object.entries(resourceMapFor(page, pack))) {
+    const blob = dataUrlToBlob(value);
+    if (blob) blobs[token] = blob;
+  }
+  blobCache.set(index, blobs);
+  return blobs;
 }
 
 /* ------------------------------------------------------------------ *
@@ -228,11 +178,20 @@ function sendMarkup() {
   if (!frameReady || !frame.contentWindow || !page) return;
   const runScripts = interactiveAttempt;
   const markup = hydrateMarkup(page, { runScripts });
-  frame.contentWindow.postMessage({ source: "pagepack-viewer", type: "load-start", runScripts, renderAttempt }, "*");
+  const target = frame.contentWindow;
+  target.postMessage({
+    source: "pagepack-viewer",
+    type: "load-start",
+    runScripts,
+    renderAttempt,
+    pageUrl: String(page.url || ""),
+    scrollTop: Number(readingState?.scroll?.[currentPageIndex]) || 0,
+  }, "*");
   for (let index = 0; index < markup.length; index += CHUNK_SIZE) {
-    frame.contentWindow.postMessage({ source: "pagepack-viewer", type: "load-chunk", renderAttempt, chunk: markup.slice(index, index + CHUNK_SIZE) }, "*");
+    target.postMessage({ source: "pagepack-viewer", type: "load-chunk", renderAttempt, chunk: markup.slice(index, index + CHUNK_SIZE) }, "*");
   }
-  frame.contentWindow.postMessage({ source: "pagepack-viewer", type: "load-end", renderAttempt }, "*");
+  target.postMessage({ source: "pagepack-viewer", type: "load-resources", renderAttempt, resources: resourceBlobsFor(currentPageIndex) }, "*");
+  target.postMessage({ source: "pagepack-viewer", type: "load-end", renderAttempt }, "*");
 }
 
 function preloadSandboxFrame() {
@@ -269,26 +228,32 @@ function hideSavedLinkLegend() {
 
 function showRenderedPage() {
   if (pageFailed) return;
+  const firstShowing = !pageRendered;
   pageRendered = true;
   clearTimeout(frameTimer);
   $("#reader-loading").hidden = true;
   $("#reader-error").hidden = true;
   $("#reader-main").hidden = false;
   renderBar();
-  showSavedLinkLegend();
+  if (firstShowing) {
+    showSavedLinkLegend();
+    rememberOpened();
+  }
 }
 
 function renderSnapshot(index, { runScripts }) {
   const frame = $("#reader-frame");
   if (!frame || !pack?.pages?.[index]) return;
   const attempt = ++renderAttempt;
+  const page = pack.pages[index];
   interactiveAttempt = Boolean(runScripts);
   pageRendered = false;
   pageFailed = false;
   clearTimeout(frameTimer);
+  const size = formatReaderBytes(pageBytes(page));
   showLoading(
     runScripts ? "Starting saved scripts…" : "Opening your save…",
-    runScripts ? "The plain snapshot stays available if this needs the network." : "Reading it from this device.",
+    runScripts ? "The plain snapshot stays available if this needs the network." : `Reading ${size} from this device.`,
   );
   renderBar();
   frame.setAttribute("sandbox", FRAME_SANDBOX);
@@ -303,8 +268,8 @@ function renderSnapshot(index, { runScripts }) {
       return;
     }
     pageFailed = true;
-    showError(new Error("This snapshot took too long to open. Try reloading the tab."));
-  }, RENDER_TIMEOUT);
+    showError(new Error(`This ${size} snapshot took too long to open. Try reloading the tab.`));
+  }, renderDeadline(page));
 }
 
 function recordHistory(mode, index) {
@@ -321,11 +286,13 @@ function recordHistory(mode, index) {
 
 function setReaderPage(index, { historyMode = "replace" } = {}) {
   if (!pack?.pages?.[index]) return;
+  flushScrollPosition();
   currentPageIndex = index;
   recordHistory(historyMode, index);
   hideUnsavedLinkNotice();
   hideSavedLinkLegend();
   closePageMenu();
+  renderSidebar();
   renderSnapshot(index, { runScripts: scriptsPreferred && packHasSavedScripts() });
 }
 
@@ -337,15 +304,60 @@ function viewerUrlForPage(packId, pageIndex) {
 }
 
 /* ------------------------------------------------------------------ *
- * Reader bar
+ * Reading state: where you were, what you have read
  * ------------------------------------------------------------------ */
+
+function localReadingState() {
+  if (!readingState) readingState = { packId: pack.id, pageIndex: 0, scroll: {}, opened: {}, lastOpenedAt: 0 };
+  return readingState;
+}
+
+function rememberOpened() {
+  const state = localReadingState();
+  state.pageIndex = currentPageIndex;
+  state.opened[currentPageIndex] = true;
+  state.lastOpenedAt = Date.now();
+  renderSidebar();
+  putReadingState(pack.id, { pageIndex: currentPageIndex }).catch(() => {});
+}
+
+function noteScrollPosition(top) {
+  const state = localReadingState();
+  state.scroll[currentPageIndex] = Math.max(0, Math.round(Number(top) || 0));
+  clearTimeout(scrollSaveTimer);
+  scrollSaveTimer = setTimeout(flushScrollPosition, SCROLL_SAVE_DELAY);
+}
+
+function flushScrollPosition() {
+  clearTimeout(scrollSaveTimer);
+  scrollSaveTimer = 0;
+  const state = readingState;
+  if (!state || !pack) return;
+  const top = state.scroll[currentPageIndex];
+  if (!Number.isFinite(Number(top))) return;
+  putReadingState(pack.id, { pageIndex: currentPageIndex, scrollTop: top }).catch(() => {});
+}
+
+/* ------------------------------------------------------------------ *
+ * Reader bar and sidebar
+ * ------------------------------------------------------------------ */
+
+function setFavicon(page) {
+  const link = $("#reader-favicon");
+  if (!link) return;
+  const icon = [page?.favicon, pack?.favicon].find((value) => typeof value === "string" && value.startsWith("data:"));
+  link.href = icon || DEFAULT_FAVICON;
+}
 
 function renderBar() {
   const page = currentPage();
   if (!page) return;
   const total = pack.pages.length;
+  const title = page.title || shortReaderUrl(page.url);
+  document.title = title;
+  setFavicon(page);
   $("#reader-bar").hidden = false;
-  $("#reader-title").textContent = page.title || shortReaderUrl(page.url);
+  $("#reader-title").textContent = title;
   $("#reader-title").title = page.title || "";
   $("#reader-subtitle").textContent = shortReaderUrl(page.url);
   $("#reader-subtitle").title = page.url || "";
@@ -360,7 +372,69 @@ function renderBar() {
   scripts.textContent = interactiveAttempt ? "Turn off scripts" : "Enable scripts";
   scripts.title = interactiveAttempt
     ? "Reload this page as a plain offline snapshot"
-    : "Run the scripts saved with this page. Some need the network and may not work.";
+    : "Experimental: run the scripts saved with this page. Some need the network, and some redraw content that is already on the page.";
+  const sidebarButton = $("#reader-sidebar-button");
+  sidebarButton.hidden = total < 2;
+  sidebarButton.setAttribute("aria-expanded", String(sidebarOpen && total >= 2));
+}
+
+function readSidebarPreference() {
+  try {
+    return localStorage.getItem(SIDEBAR_KEY) !== "closed";
+  } catch {
+    return true;
+  }
+}
+
+function writeSidebarPreference(open) {
+  try {
+    localStorage.setItem(SIDEBAR_KEY, open ? "open" : "closed");
+  } catch {
+    // A preference that cannot be kept is not worth an error.
+  }
+}
+
+function renderSidebar() {
+  const aside = $("#reader-sidebar");
+  const total = pack?.pages?.length || 0;
+  const open = sidebarOpen && total >= 2;
+  aside.hidden = !open;
+  $("#reader-main").classList.toggle("has-sidebar", open);
+  $("#reader-sidebar-button")?.setAttribute("aria-expanded", String(open));
+  if (!open) return;
+  $("#reader-sidebar-count").textContent = `${total} pages`;
+  const list = $("#reader-sidebar-list");
+  const opened = readingState?.opened || {};
+  list.replaceChildren(...pack.pages.map((page, index) => {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "sidebar-page";
+    button.dataset.pageIndex = String(index);
+    if (index === currentPageIndex) button.setAttribute("aria-current", "page");
+    if (opened[index]) button.classList.add("is-read");
+    const number = document.createElement("span");
+    number.className = "sidebar-page-number";
+    number.textContent = String(index + 1);
+    const copy = document.createElement("span");
+    copy.className = "sidebar-page-copy";
+    const title = document.createElement("strong");
+    title.textContent = page.title || shortReaderUrl(page.url);
+    const url = document.createElement("span");
+    url.textContent = shortReaderUrl(page.url);
+    copy.append(title, url);
+    button.append(number, copy);
+    button.title = page.url || "";
+    item.append(button);
+    return item;
+  }));
+}
+
+function toggleSidebar() {
+  sidebarOpen = !sidebarOpen;
+  writeSidebarPreference(sidebarOpen);
+  renderSidebar();
+  renderBar();
 }
 
 function closePageMenu() {
@@ -443,9 +517,7 @@ function showUnsavedLinkNotice(url) {
 }
 
 function pageIndexForUrl(url) {
-  const target = canonicalViewerUrl(url, pack?.pages?.[currentPageIndex]?.url);
-  if (!target) return -1;
-  return (pack?.pages || []).findIndex((page) => canonicalViewerUrl(page.url, page.url) === target);
+  return packPageIndexForUrl(pack, url, pack?.pages?.[currentPageIndex]?.url);
 }
 
 async function handleLink(href) {
@@ -502,6 +574,15 @@ function initializeFrameMessaging() {
       showRenderedPage();
       return;
     }
+    if (message.source === "pagepack-sandbox" && message.type === "scroll") {
+      if (message.renderAttempt === renderAttempt && pageRendered) noteScrollPosition(message.top);
+      return;
+    }
+    if (message.source === "pagepack-sandbox" && message.type === "key") {
+      if (message.key === "ArrowLeft") stepPage(-1);
+      if (message.key === "ArrowRight") stepPage(1);
+      return;
+    }
     if (message.source === "pagepack-saved-page" && message.type === "link") {
       handleLink(message.href).catch(() => openOriginal(message.href));
     }
@@ -518,7 +599,7 @@ function requestedPageIndex(value) {
     const match = pageIndexForUrl(value);
     if (match >= 0) return match;
   }
-  return 0;
+  return -1;
 }
 
 function handleReaderHistory() {
@@ -528,7 +609,7 @@ function handleReaderHistory() {
     location.reload();
     return;
   }
-  const index = requestedPageIndex(params.get("page"));
+  const index = Math.max(0, requestedPageIndex(params.get("page")));
   if (index === currentPageIndex) return;
   setReaderPage(index, { historyMode: "none" });
 }
@@ -536,6 +617,11 @@ function handleReaderHistory() {
 /* ------------------------------------------------------------------ *
  * Startup
  * ------------------------------------------------------------------ */
+
+function isEditableTarget(node) {
+  if (!node || node.nodeType !== 1) return false;
+  return node.isContentEditable || /^(?:input|textarea|select)$/i.test(node.tagName || "");
+}
 
 function wireControls() {
   $("#retry-reader").addEventListener("click", () => location.reload());
@@ -545,6 +631,12 @@ function wireControls() {
   $("#reader-prev").addEventListener("click", () => stepPage(-1));
   $("#reader-next").addEventListener("click", () => stepPage(1));
   $("#reader-page-button").addEventListener("click", togglePageMenu);
+  $("#reader-sidebar-button").addEventListener("click", toggleSidebar);
+  $("#reader-sidebar-list").addEventListener("click", (event) => {
+    const option = event.target.closest("[data-page-index]");
+    if (!option) return;
+    setReaderPage(Number(option.dataset.pageIndex), { historyMode: "push" });
+  });
   $("#reader-page-menu").addEventListener("click", (event) => {
     const option = event.target.closest("[data-page-index]");
     if (!option) return;
@@ -580,6 +672,15 @@ function wireControls() {
   document.addEventListener("pointerdown", (event) => {
     if (!$("#reader-page-menu").contains(event.target) && event.target !== $("#reader-page-button")) closePageMenu();
   }, true);
+  // ← and → move between the pages of a save. The sandbox forwards the same
+  // keys when the saved page has focus, which is most of the time.
+  document.addEventListener("keydown", (event) => {
+    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    if (!$("#reader-page-menu").hidden || isEditableTarget(event.target)) return;
+    if (event.key === "ArrowLeft") stepPage(-1);
+    else if (event.key === "ArrowRight") stepPage(1);
+  });
+  window.addEventListener("pagehide", flushScrollPosition);
 }
 
 async function repairStylesIfNeeded() {
@@ -588,7 +689,7 @@ async function repairStylesIfNeeded() {
   if (!needsRepair) return;
   await withTimeout(sendRuntimeMessage({ type: "REPAIR_PACK", id: pack.id }), 20000, "Saved style repair took too long.")
     .catch(() => null);
-  const repaired = await withTimeout(getPack(pack.id), 12000, "Saved pack storage took too long to respond.").catch(() => null);
+  const repaired = await withTimeout(getPack(pack.id), 30000, "Saved pack storage took too long to respond.").catch(() => null);
   if (repaired) pack = repaired;
 }
 
@@ -596,14 +697,20 @@ async function init() {
   initializeFrameMessaging();
   preloadSandboxFrame();
   wireControls();
+  sidebarOpen = readSidebarPreference();
   const params = new URLSearchParams(location.search);
   const packId = params.get("pack");
   if (!packId) throw new Error("This reader link does not name a saved page.");
-  pack = await withTimeout(getPack(packId), 12000, "Saved pack storage took too long to respond.");
+  pack = await withTimeout(getPack(packId), 30000, "Saved pack storage took too long to respond.");
   if (!pack) throw new Error("This save is missing its data. Delete it from your library and save the page again.");
   if (!Array.isArray(pack.pages) || !pack.pages.length) throw new Error("This save contains no readable pages.");
+  readingState = await getReadingState(packId).catch(() => null);
   await repairStylesIfNeeded();
-  setReaderPage(requestedPageIndex(params.get("page") || "0"), { historyMode: "replace" });
+  // A link that names a page opens that page; a bare link to the save resumes
+  // where it was last left.
+  const requested = requestedPageIndex(params.get("page"));
+  const resumed = Math.min(Number(readingState?.pageIndex) || 0, pack.pages.length - 1);
+  setReaderPage(requested >= 0 ? requested : resumed, { historyMode: "replace" });
 }
 
 window.addEventListener("popstate", handleReaderHistory);

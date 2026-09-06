@@ -22,11 +22,14 @@ Save the page you are viewing—with its layout, images, styles, fonts, and dire
 
 PagePack includes:
 
-- One-click capture of the page you are viewing, with live progress and a cancel button.
+- One-click capture of the page you are viewing, with live progress and a cancel button. Ctrl+Shift+S (⌘⇧S on Mac) saves the current page; “Save link with PagePack” on any link saves the page behind it without opening it.
+- Save all tabs in this window: every open page becomes its own save, with the ones already in your library unticked for you.
 - Save as I browse: PagePack collects the starting page, pages visited in that tab, and child tabs opened from it, then lets you review and untick pages before saving them as one item.
-- Optional same-site link following, up to three levels deep.
-- Folders, search across saved titles, addresses and page text, move and reorder by pointer or keyboard, and offline navigation between saved pages.
-- A reader with page-to-page navigation, the site’s live page one click away, and a clear “✓ Saved” badge on links that open offline.
+- Optional same-site link following, up to three levels deep — with a pre-flight that finds the pages first, tells you how many and roughly how much (“37 pages found · ~12 MB estimated”), and lets you untick any before a single page is saved.
+- Already saved? The popup says when (“Saved 2 h ago”) and offers to open that copy; every save has an Update that captures it again in place.
+- Folders, search across saved titles, addresses and page text, move and reorder by pointer or keyboard, and offline navigation between saved pages. Opened as a full page, the library shows a picture of each save, a storage line, and sort and filter controls.
+- Export as HTML: one self-contained file per save, readable in any browser.
+- A reader with page-to-page navigation, a sidebar listing the pages of a save, ← and → to step between them, your place on every page remembered, the site’s live page one click away, and a clear “✓ Saved” badge on links that open offline.
 - Partial saves are reported plainly: each item shows what is missing and offers a retry.
 - A sandboxed reader that blocks saved pages from accessing your cookies, extension data, or the network.
 - A plain snapshot opens first so nothing can stall offline reading; saved scripts can be switched on from the reader when a page needs them.
@@ -43,6 +46,9 @@ Some pages cannot be captured completely, including DRM video, live streams, blo
 - **storage / unlimitedStorage**: Stores the offline library locally. Page packs can be much larger than the default extension storage allowance.
 - **host access to all sites**: Fetches the styles, images, fonts, direct media, and same-site linked pages explicitly requested by the user. Assets can be hosted on domains different from the page itself.
 - **webNavigation**: Watches completed navigation only while a user-requested collection is active, and checks the local URL index when a normal navigation fails offline. Those relationships are stored locally with the collection; navigation data is not transmitted.
+- **contextMenus**: Adds one item, “Save link with PagePack”, to the context menu of links. It does nothing until chosen; choosing it saves the page behind that link.
+- **commands** (`Ctrl+Shift+S`): A keyboard shortcut for “save this page”. Chrome may decline the suggested key if another extension holds it; it can be changed at `chrome://extensions/shortcuts`.
+- **activeTab**: Lets `tabs.captureVisibleTab` take a small picture of the tab you invoked PagePack on — from the popup, the shortcut or a batch — to show beside that save in the library’s full-page view. Chrome grants it for that one tab and that one gesture, and shows no install-time warning for it. The picture is taken only while the tab is in front and is stored locally like everything else; the host permission above does not cover this call, which is why the permission is listed.
 
 ## Published policy URLs
 

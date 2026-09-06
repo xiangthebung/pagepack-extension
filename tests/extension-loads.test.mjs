@@ -133,6 +133,9 @@ assert.ok(extensionId, "the extension never loaded; nothing below can run");
 
 await check("the popup renders with no page errors", async () => {
   const page = await context.newPage();
+  // At the popup's own size. Anything wider is this document opened as a tab,
+  // which lays out as the library page and is the next check.
+  await page.setViewportSize({ width: 400, height: 600 });
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error") errors.push(`console: ${message.text()}`); });
@@ -142,6 +145,36 @@ await check("the popup renders with no page errors", async () => {
   assert.deepEqual(errors, [], `the popup logged errors:\n${errors.join("\n")}`);
   assert.match(text, /Save page/, "the popup did not render its primary action");
   assert.match(text, /Library/);
+  await page.close();
+});
+
+/* The reader's Library button opens this same document in a tab. It used to
+   arrive as a 400px panel pinned to the corner of an empty page — `html` kept
+   the popup's fixed width — so the width is asserted, not just the content. */
+await check("opened in a tab, the popup lays out as a full-width library page", async () => {
+  const page = await context.newPage();
+  await page.setViewportSize({ width: 1180, height: 820 });
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  page.on("console", (message) => { if (message.type() === "error") errors.push(`console: ${message.text()}`); });
+  await page.goto(`chrome-extension://${extensionId}/popup.html#library`, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(2500);
+  const layout = await page.evaluate(() => ({
+    width: document.documentElement.getBoundingClientRect().width,
+    saveHidden: document.getElementById("save-view").hidden,
+    tabs: getComputedStyle(document.querySelector(".tabs")).display,
+    sortShown: document.getElementById("library-sort").getBoundingClientRect().width > 0,
+    filterShown: document.getElementById("library-filter").getBoundingClientRect().width > 0,
+    saveTabsHidden: document.getElementById("library-save-tabs-button").hidden,
+    text: document.body.innerText,
+  }));
+  assert.deepEqual(errors, [], `the library page logged errors:\n${errors.join("\n")}`);
+  assert.ok(layout.width > 1000, `the library page is only ${layout.width}px wide`);
+  assert.equal(layout.saveHidden, true, "a tab has no page to save, so the Save view must not show");
+  assert.equal(layout.tabs, "none", "the Save/Library tab strip must not show on the page");
+  assert.ok(layout.sortShown && layout.filterShown, "the sort and filter controls are not showing");
+  assert.equal(layout.saveTabsHidden, false, "the page should offer to save all open tabs");
+  assert.match(layout.text, /Library/);
   await page.close();
 });
 
@@ -259,6 +292,9 @@ await check("a page saved through the extension reads back with no network reque
     return storage.findSavedUrl(url);
   }, `${origin}/torture`);
   assert.equal(stillFound, null, "a deleted pack is still reachable through the saved-URL index");
+  await reader.close();
+  await driver.close();
+  await tab.close();
 });
 
 /* ------------------------------------------------------------------ *
@@ -320,7 +356,175 @@ await check("a single-page save shows the working dot and clears", async () => {
   }
   assert.ok(seen.includes("•"), `a single-page save should show the working dot. Saw: ${JSON.stringify([...new Set(seen)])}`);
   assert.equal(seen[seen.length - 1], "", "the badge was left set after a single-page save finished");
+  // Nothing may be left for the checks below, which count tabs and packs.
+  const library = await driver.evaluate(() => chrome.runtime.sendMessage({ type: "LIST_LIBRARY" }));
+  for (const pack of library?.packs || []) {
+    await driver.evaluate((id) => chrome.runtime.sendMessage({ type: "DELETE_PACK", id }), pack.id);
+  }
+  await driver.close();
+  await tab.close();
 });
+
+/* ------------------------------------------------------------------ *
+ * The shortcut, the context menu, the pre-flight, duplicates, batches
+ * ------------------------------------------------------------------ */
+
+responseDelayMs = 0;
+const manifest = JSON.parse(await readFile(join(dist, "manifest.json"), "utf8"));
+const control = await context.newPage();
+await control.goto(`chrome-extension://${extensionId}/viewer.html`);
+const ask = (message) => control.evaluate((payload) => chrome.runtime.sendMessage(payload), message);
+const libraryNow = async () => (await ask({ type: "LIST_LIBRARY" })) || {};
+/** Polls until no save is running, then returns the library. */
+async function settledLibrary(timeoutMs = 60000) {
+  const deadline = Date.now() + timeoutMs;
+  let library = await libraryNow();
+  while (Date.now() < deadline) {
+    const active = (library.captures || []).some((capture) => ["queued", "reading", "saving", "finishing"].includes(capture.state));
+    if (!active && (await readBadge()).text === "") return library;
+    await control.waitForTimeout(80);
+    library = await libraryNow();
+  }
+  throw new Error("a save never finished");
+}
+
+await check("the shortcut and the context-menu permission are declared, and Chrome registered the command", async () => {
+  assert.equal(manifest.commands?.["save-page"]?.suggested_key?.default, "Ctrl+Shift+S");
+  assert.ok(manifest.permissions.includes("contextMenus"), "the manifest does not ask for contextMenus");
+  const commands = await serviceWorker.evaluate(() => chrome.commands.getAll());
+  assert.ok(commands.some((command) => command.name === "save-page"), `Chrome did not register save-page: ${JSON.stringify(commands)}`);
+});
+
+let preflightPack = null;
+await check("a linked save is pre-flighted: the same-site pages are counted first, and only the ticked ones are saved", async () => {
+  const tab = await context.newPage();
+  await tab.goto(`${origin}/torture`, { waitUntil: "load" });
+  const target = (await control.evaluate(() => chrome.tabs.query({}))).find((candidate) => candidate.url?.endsWith("/torture"));
+  const discovery = await ask({ type: "DISCOVER_LINKS", tabId: target.id, pageUrl: target.url, pageTitle: target.title, depth: 2, runScripts: true, maxPages: 250 });
+  assert.ok(discovery?.discoveryId, `discovery was refused: ${JSON.stringify(discovery)}`);
+  // The fixture links to /another-page on its own site and to a CDN that is not;
+  // /another-page links onward to /third-page, which depth 2 reaches.
+  assert.deepEqual(
+    discovery.pages.map((page) => [page.url.replace(origin, ""), page.level]),
+    [["/another-page", 1], ["/third-page", 2]],
+    `the wrong pages were found: ${JSON.stringify(discovery.pages)}`,
+  );
+  assert.equal(discovery.pages[0].title, "Another page", "a discovered page should carry its real title");
+  assert.ok(discovery.estimatedBytes > 0, "no size estimate was produced");
+  // Only the first level is kept; the save must respect that.
+  const started = await ask({
+    type: "START_CAPTURE", tabId: target.id, pageUrl: target.url, pageTitle: target.title, depth: 2,
+    discoveryId: discovery.discoveryId, selectedUrls: [`${origin}/another-page`],
+  });
+  assert.ok(started?.accepted, `the pre-flighted save was refused: ${JSON.stringify(started)}`);
+  const progress = await libraryNow();
+  const record = (progress.captures || []).find((capture) => capture.id === started.requestId);
+  assert.equal(record?.pagesTotal, 2, "the capture record should know its page count up front");
+  const library = await settledLibrary();
+  preflightPack = (library.packs || []).find((pack) => pack.rootUrl === `${origin}/torture`);
+  assert.ok(preflightPack, "the pre-flighted save produced no pack");
+  assert.deepEqual(preflightPack.pages.map((page) => page.url.replace(origin, "")), ["/torture", "/another-page"], "the unticked page was saved anyway");
+  await tab.close();
+});
+
+await check("the same address reports as already saved, and Update re-captures it in place", async () => {
+  const found = await ask({ type: "FIND_SAVED_URL", url: `${origin}/torture#fragment` });
+  assert.equal(found?.match?.packId, preflightPack.id, "the saved copy was not found by its address");
+  assert.ok(found.match.savedAt > 0);
+  const { folder } = await ask({ type: "CREATE_FOLDER", name: "Kept" });
+  await ask({ type: "MOVE_PACK", id: preflightPack.id, folderId: folder.id });
+  const libraryBefore = await libraryNow();
+  const before = libraryBefore.packs.find((pack) => pack.id === preflightPack.id);
+  const update = await ask({ type: "UPDATE_PACK", id: preflightPack.id });
+  assert.ok(update?.accepted, `the update was refused: ${JSON.stringify(update)}`);
+  const library = await settledLibrary();
+  const after = library.packs.find((pack) => pack.id === preflightPack.id);
+  assert.ok(after, "the updated pack vanished");
+  assert.equal(after.folderId, folder.id, "the update moved the pack out of its folder");
+  assert.equal(after.sortOrder, before.sortOrder, "the update changed the pack's position");
+  assert.equal(after.savedAt, before.savedAt, "the update should keep the original save date");
+  assert.ok(after.updatedAt > before.savedAt, "the update did not record when it happened");
+  assert.deepEqual(after.pages.map((page) => page.url), before.pages.map((page) => page.url), "the update changed which pages the save holds");
+  assert.equal(library.packs.filter((pack) => pack.rootUrl === `${origin}/torture`).length, 1, "the update created a second pack instead of replacing the first");
+  assert.equal(library.packs.length, libraryBefore.packs.length, "the update changed how many saves there are");
+});
+
+await check("save all tabs writes one pack per tab, and a link can be saved without opening it", async () => {
+  const first = await context.newPage();
+  await first.goto(`${origin}/another-page`, { waitUntil: "load" });
+  const second = await context.newPage();
+  await second.goto(`${origin}/third-page`, { waitUntil: "load" });
+  /* The picture of the tab comes from `chrome.tabs.captureVisibleTab`, which
+     needs `activeTab` — granted only by a gesture on the extension, which this
+     harness cannot make. A real screenshot of the tab stands in for the API's
+     answer; everything after it — the active-tab rule, the scaling in the
+     worker, the store — is the extension's own. */
+  const picture = (await second.screenshot({ type: "jpeg", quality: 70 })).toString("base64");
+  await serviceWorker.evaluate((data) => { chrome.tabs.captureVisibleTab = async () => `data:image/jpeg;base64,${data}`; }, picture);
+  const tabs = (await control.evaluate(() => chrome.tabs.query({})))
+    .filter((candidate) => /\/(another|third)-page$/.test(candidate.url || ""))
+    .map((candidate) => ({ tabId: candidate.id, url: candidate.url, title: candidate.title }));
+  assert.equal(tabs.length, 2, `expected the two tabs just opened, found ${JSON.stringify(tabs.map((tab) => tab.url))}`);
+  const packsBefore = (await libraryNow()).packs.length;
+  const batch = await ask({ type: "START_BATCH", tabs, runScripts: true });
+  assert.ok(batch?.accepted, `the batch was refused: ${JSON.stringify(batch)}`);
+  let library = await settledLibrary();
+  const roots = library.packs.map((pack) => pack.rootUrl.replace(origin, "")).sort();
+  assert.deepEqual(roots, ["/another-page", "/third-page", "/torture"], "each tab should have become its own save");
+  const batched = library.packs.filter((pack) => pack.rootUrl !== `${origin}/torture`);
+  assert.ok(batched.every((pack) => pack.stats.pages === 1 && pack.pages.length === 1));
+  const { thumbnails } = await ask({ type: "GET_THUMBNAILS", ids: batched.map((pack) => pack.id) });
+  const thirdPack = batched.find((pack) => pack.rootUrl === `${origin}/third-page`);
+  assert.deepEqual(Object.keys(thumbnails || {}), [thirdPack.id], "only the tab in front should get a picture, and it should get one");
+  const size = await control.evaluate((src) => new Promise((resolve) => {
+    const image = new Image();
+    image.onload = () => resolve([image.naturalWidth, image.naturalHeight]);
+    image.onerror = () => resolve("did not decode");
+    image.src = src;
+  }), thumbnails[thirdPack.id]);
+  assert.deepEqual(size, [320, 200], `the picture should be scaled for a library row, got ${JSON.stringify(size)}`);
+  await first.close();
+  await second.close();
+
+  const link = await ask({ type: "SAVE_LINK", url: `${origin}/third-page?from=menu` });
+  assert.ok(link?.accepted, `saving a link was refused: ${JSON.stringify(link)}`);
+  library = await settledLibrary();
+  const fromLink = library.packs.find((pack) => pack.rootUrl === `${origin}/third-page?from=menu`);
+  assert.ok(fromLink, "the link was not saved");
+  assert.equal(fromLink.title, "Third page", "a link saved without a tab should still be titled from its page");
+  assert.equal(library.packs.length, packsBefore + 3, "two tabs and one link should be three more saves");
+});
+
+await check("the library index carries the site icon and the reading state answers unread", async () => {
+  const library = await libraryNow();
+  const withIcon = library.packs.filter((pack) => typeof pack.favicon === "string" && pack.favicon.startsWith("data:image/"));
+  // The fixture site answers /favicon.ico with a GIF, like everything else it does not recognise.
+  assert.ok(withIcon.length >= 1, "no saved page carried its site icon into the library index");
+  assert.deepEqual(library.reading, {}, "nothing has been read yet");
+  await ask({ type: "PUT_READING_STATE", packId: preflightPack.id, patch: { pageIndex: 1, scrollTop: 300 } });
+  const after = await libraryNow();
+  assert.equal(after.reading[preflightPack.id]?.pageIndex, 1);
+  assert.equal(after.reading[preflightPack.id]?.scroll?.[1], 300);
+});
+
+await check("the reader names its tab after the page and carries the captured site icon", async () => {
+  const reader = await context.newPage();
+  await reader.goto(`chrome-extension://${extensionId}/viewer.html?pack=${preflightPack.id}&page=0`, { waitUntil: "domcontentloaded" });
+  await reader.waitForSelector("#reader-main:not([hidden])", { timeout: 20000 });
+  assert.equal(await reader.title(), preflightPack.pages[0].title, "the tab is not named after the page");
+  const favicon = await reader.evaluate(() => document.getElementById("reader-favicon")?.getAttribute("href") || "");
+  assert.match(favicon, /^data:image\//, `the tab icon should be the site's captured icon, got ${favicon.slice(0, 40)}`);
+  // The page list beside the reader, and the page it resumes on.
+  const sidebar = await reader.evaluate(() => ({
+    hidden: document.getElementById("reader-sidebar").hidden,
+    titles: [...document.querySelectorAll("#reader-sidebar-list .sidebar-page strong")].map((node) => node.textContent),
+  }));
+  assert.equal(sidebar.hidden, false, "a two-page save should list its pages beside the reader");
+  assert.deepEqual(sidebar.titles, preflightPack.pages.map((page) => page.title));
+  await reader.close();
+});
+
+await control.close();
 
 await context.close();
 await rm(profile, { recursive: true, force: true }).catch(() => {});

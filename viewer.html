@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>PagePack reader</title>
+    <link id="reader-favicon" rel="icon" href="icons/icon-32.png">
     <link rel="stylesheet" href="viewer.css">
   </head>
   <body>
@@ -12,6 +13,9 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 6l-6 6 6 6"/></svg>
         <span>Library</span>
       </button>
+      <button id="reader-sidebar-button" class="bar-icon" type="button" aria-label="Show the pages in this save" aria-expanded="false" aria-controls="reader-sidebar" title="Pages in this save" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 5.5h15v13h-15zM9.5 5.5v13M6.5 9h1M6.5 12h1M6.5 15h1"/></svg>
+      </button>
 
       <div class="reader-identity">
         <strong id="reader-title">Saved page</strong>
@@ -19,13 +23,13 @@
       </div>
 
       <div id="reader-nav" class="reader-nav" hidden>
-        <button id="reader-prev" class="bar-icon" type="button" aria-label="Previous page in this save">
+        <button id="reader-prev" class="bar-icon" type="button" aria-label="Previous page in this save" title="Previous page (←)">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 6l-6 6 6 6"/></svg>
         </button>
         <button id="reader-page-button" class="bar-button bar-button-quiet" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="reader-page-menu">
           <span id="reader-page-label">1 of 1</span>
         </button>
-        <button id="reader-next" class="bar-icon" type="button" aria-label="Next page in this save">
+        <button id="reader-next" class="bar-icon" type="button" aria-label="Next page in this save" title="Next page (→)">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 6l6 6-6 6"/></svg>
         </button>
       </div>
@@ -37,19 +41,28 @@
     <div id="reader-page-menu" class="reader-page-menu" role="listbox" aria-label="Pages in this save" hidden></div>
 
     <main id="reader-main" hidden>
-      <aside id="reader-link-legend" class="reader-toast" role="status" hidden>Links marked “Saved” open offline</aside>
-      <aside id="reader-unsaved-note" class="reader-unsaved-note" role="alert" hidden>
-        <div class="reader-unsaved-copy">
-          <strong>That page isn’t in this save</strong>
-          <span id="reader-unsaved-url"></span>
+      <aside id="reader-sidebar" class="reader-sidebar" aria-label="Pages in this save" hidden>
+        <div class="sidebar-head">
+          <strong>In this save</strong>
+          <span id="reader-sidebar-count">1 page</span>
         </div>
-        <button id="reader-open-link-button" class="bar-button" type="button">Open online</button>
-        <button id="reader-dismiss-unsaved-button" class="bar-icon" type="button" aria-label="Dismiss">
-          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg>
-        </button>
+        <ol id="reader-sidebar-list" class="sidebar-list"></ol>
       </aside>
-      <p id="reader-mode-status" class="visually-hidden" role="status" aria-live="polite"></p>
-      <iframe id="reader-frame" title="Saved page"></iframe>
+      <div class="reader-stage">
+        <aside id="reader-link-legend" class="reader-toast" role="status" hidden>Links marked “Saved” open offline</aside>
+        <aside id="reader-unsaved-note" class="reader-unsaved-note" role="alert" hidden>
+          <div class="reader-unsaved-copy">
+            <strong>That page isn’t in this save</strong>
+            <span id="reader-unsaved-url"></span>
+          </div>
+          <button id="reader-open-link-button" class="bar-button" type="button">Open online</button>
+          <button id="reader-dismiss-unsaved-button" class="bar-icon" type="button" aria-label="Dismiss">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg>
+          </button>
+        </aside>
+        <p id="reader-mode-status" class="visually-hidden" role="status" aria-live="polite"></p>
+        <iframe id="reader-frame" title="Saved page"></iframe>
+      </div>
     </main>
 
     <section id="reader-loading" class="reader-message">

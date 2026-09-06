@@ -2,11 +2,19 @@ import { removePackPageFromPack } from "./pack-page.js";
 import { journeyQueueSummary } from "./journey-queue.js";
 
 const PAGEPACK_DB = "pagepack-db";
-const PAGEPACK_DB_VERSION = 9;
+// 10 adds two small stores beside the packs: `reading`, one row per pack holding
+// where the reader got to, and `thumbnails`, a picture of the tab at the moment
+// it was saved. Both are kept out of the pack row on purpose — a scroll position
+// that rewrote a 30 MB record every second would be the wrong shape entirely.
+const PAGEPACK_DB_VERSION = 10;
 const LEGACY_ROOT_FOLDER_ID = "unfiled";
 // Bounded per page so the library index stays small enough to read and search
 // quickly. Enough text to match a title, headings, and the opening paragraphs.
 const SEARCH_TEXT_LIMIT = 4000;
+/* Two placed neighbours whose sort values are this close have run out of room
+   between them, and the folder is renumbered instead of splitting the gap again.
+   Reached only after a few dozen consecutive drops into the same slot. */
+const MIN_SORT_GAP = 1e-6;
 export const DEFAULT_FOLDER_ID = null;
 export const FOLDER_NAME_LIMIT = 60;
 
@@ -34,6 +42,11 @@ function packSortValue(pack) {
   return Number.isFinite(order) ? order : Number.MAX_SAFE_INTEGER;
 }
 
+/** When the copy in the pack was last captured: the update if there was one, else the save. */
+function packCapturedAt(pack) {
+  return Number(pack?.updatedAt) || Number(pack?.savedAt) || 0;
+}
+
 function completeKnownOrder(requestedIds, existingIds) {
   const existing = [...new Set(existingIds)];
   const existingSet = new Set(existing);
@@ -49,12 +62,15 @@ function completeKnownOrder(requestedIds, existingIds) {
   return existing.map((id) => seen.has(id) ? requested[requestedIndex++] : id);
 }
 
-function orderedPackIdsFor(summaries, folderId) {
+function orderedPacksFor(summaries, folderId) {
   const normalizedFolderId = normalizeFolderId(folderId);
   return summaries
     .filter((pack) => normalizeFolderId(pack.folderId) === normalizedFolderId)
-    .sort((a, b) => packSortValue(a) - packSortValue(b) || Number(b.savedAt || 0) - Number(a.savedAt || 0))
-    .map((pack) => pack.id);
+    .sort((a, b) => packSortValue(a) - packSortValue(b) || Number(b.savedAt || 0) - Number(a.savedAt || 0));
+}
+
+function orderedPackIdsFor(summaries, folderId) {
+  return orderedPacksFor(summaries, folderId).map((pack) => pack.id);
 }
 
 function searchableText(html) {
@@ -68,16 +84,26 @@ function searchableText(html) {
     .toLowerCase();
 }
 
+/** The site icon the library shows for a pack: the root page's, or the first page that has one. */
+function packFavicon(pack) {
+  if (typeof pack.favicon === "string" && pack.favicon.startsWith("data:")) return pack.favicon;
+  const page = (pack.pages || []).find((candidate) => typeof candidate.favicon === "string" && candidate.favicon.startsWith("data:"));
+  return page ? page.favicon : null;
+}
+
 function packSummary(pack) {
   return {
     id: pack.id,
     rootUrl: pack.rootUrl,
     title: pack.title || pack.rootUrl,
     savedAt: pack.savedAt,
+    updatedAt: Number(pack.updatedAt) || null,
     depth: pack.depth,
+    runScripts: pack.runScripts !== false,
     captureMode: pack.captureMode || (pack.scope === "journey" ? "journey" : "page"),
     folderId: normalizeFolderId(pack.folderId),
     sortOrder: pack.sortOrder,
+    favicon: packFavicon(pack),
     stats: pack.stats || { pages: pack.pages?.length || 0, bytes: 0, resources: 0 },
     failures: Array.isArray(pack.failures) ? pack.failures.slice(0, 500) : [],
     pages: (pack.pages || []).map((page) => ({
@@ -85,6 +111,18 @@ function packSummary(pack) {
       title: page.title,
       searchText: searchableText(page.html)
     }))
+  };
+}
+
+function urlIndexRow(pack, page, pageIndex) {
+  const url = canonicalUrl(page.url);
+  return {
+    key: `${url}|${pack.id}`,
+    url,
+    packId: pack.id,
+    pageUrl: url,
+    pageIndex,
+    savedAt: packCapturedAt(pack)
   };
 }
 
@@ -104,6 +142,8 @@ function openPagePackDb() {
       }
       if (!db.objectStoreNames.contains("captures")) db.createObjectStore("captures", { keyPath: "id" });
       if (!db.objectStoreNames.contains("journeys")) db.createObjectStore("journeys", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("reading")) db.createObjectStore("reading", { keyPath: "packId" });
+      if (!db.objectStoreNames.contains("thumbnails")) db.createObjectStore("thumbnails", { keyPath: "id" });
 
       const folders = transaction.objectStore("folders");
       if (event.oldVersion < 4) folders.delete(LEGACY_ROOT_FOLDER_ID);
@@ -138,24 +178,24 @@ function openPagePackDb() {
             });
           };
         }
+        /* The index is rebuilt on every upgrade, because its shape is what upgrades
+           change. The pack row itself is only rewritten when a field on it actually
+           changes: a library of large saves must not be copied in full to add a
+           column the packs do not carry. */
         packs.openCursor().onsuccess = (event) => {
           const cursor = event.target.result;
           if (!cursor) return;
           const pack = cursor.value;
-          pack.folderId = normalizeFolderId(pack.folderId);
-          if (packOrderById.has(pack.id)) pack.sortOrder = packOrderById.get(pack.id);
-          cursor.update(pack);
+          const folderId = normalizeFolderId(pack.folderId);
+          const sortOrder = packOrderById.has(pack.id) ? packOrderById.get(pack.id) : pack.sortOrder;
+          if (folderId !== pack.folderId || sortOrder !== pack.sortOrder) {
+            pack.folderId = folderId;
+            pack.sortOrder = sortOrder;
+            cursor.update(pack);
+          }
           packIndex.put(packSummary(pack));
           for (const [pageIndex, page] of (pack.pages || []).entries()) {
-            const url = canonicalUrl(page.url);
-            urlIndex.put({
-              key: `${url}|${pack.id}`,
-              url,
-              packId: pack.id,
-              pageUrl: url,
-              pageIndex,
-              savedAt: pack.savedAt
-            });
+            urlIndex.put(urlIndexRow(pack, page, pageIndex));
           }
           cursor.continue();
         };
@@ -209,17 +249,19 @@ export function putPack(pack) {
     transaction.objectStore("packs").put(normalizedPack);
     transaction.objectStore("packIndex").put(summary);
     const urlIndex = transaction.objectStore("urlIndex");
-    for (const [pageIndex, page] of (normalizedPack.pages || []).entries()) {
-      const url = canonicalUrl(page.url);
-      urlIndex.put({
-        key: `${url}|${normalizedPack.id}`,
-        url,
-        packId: normalizedPack.id,
-        pageUrl: url,
-        pageIndex,
-        savedAt: normalizedPack.savedAt
-      });
-    }
+    // An update can drop a page, so rows for this pack are cleared before being
+    // written again; otherwise a URL removed from the pack would stay findable.
+    urlIndex.openCursor().onsuccess = (event) => {
+      const cursor = event.target.result;
+      if (!cursor) {
+        for (const [pageIndex, page] of (normalizedPack.pages || []).entries()) {
+          urlIndex.put(urlIndexRow(normalizedPack, page, pageIndex));
+        }
+        return;
+      }
+      if (cursor.value?.packId === normalizedPack.id) cursor.delete();
+      cursor.continue();
+    };
   });
 }
 
@@ -275,9 +317,11 @@ export function searchPackText(query) {
  * kept resolving, and its Open led to a reader page for a pack that was gone.
  */
 export function deletePack(id) {
-  return runTransaction(["packs", "packIndex", "urlIndex"], "readwrite", (transaction) => {
+  return runTransaction(["packs", "packIndex", "urlIndex", "reading", "thumbnails"], "readwrite", (transaction) => {
     transaction.objectStore("packs").delete(id);
     transaction.objectStore("packIndex").delete(id);
+    transaction.objectStore("reading").delete(id);
+    transaction.objectStore("thumbnails").delete(id);
     const urlIndex = transaction.objectStore("urlIndex");
     urlIndex.openCursor().onsuccess = (event) => {
       const cursor = event.target.result;
@@ -306,15 +350,7 @@ export function removePackPage(id, pageIndex) {
       const urlIndex = transaction.objectStore("urlIndex");
       if (!stillPresent) urlIndex.delete(`${removedUrl}|${id}`);
       for (const [pageIndex, page] of (normalizedPack.pages || []).entries()) {
-        const url = canonicalUrl(page.url);
-        urlIndex.put({
-          key: `${url}|${id}`,
-          url,
-          packId: id,
-          pageUrl: url,
-          pageIndex,
-          savedAt: normalizedPack.savedAt,
-        });
+        urlIndex.put(urlIndexRow(normalizedPack, page, pageIndex));
       }
     }).then(() => normalizedPack);
   });
@@ -324,6 +360,13 @@ export function findSavedUrl(value) {
   const url = canonicalUrl(value);
   return runStoreRequest("urlIndex", "readonly", (store) => store.index("byUrl").getAll(url))
     .then((matches) => matches.sort((a, b) => b.savedAt - a.savedAt)[0] || null);
+}
+
+/** Every saved copy of each of the given URLs, newest first, keyed by canonical URL. */
+export function findSavedUrls(values) {
+  const urls = [...new Set((Array.isArray(values) ? values : []).map(canonicalUrl))];
+  return Promise.all(urls.map((url) => findSavedUrl(url).then((match) => [url, match])))
+    .then((pairs) => Object.fromEntries(pairs.filter(([, match]) => match)));
 }
 
 export function listFolders() {
@@ -347,8 +390,6 @@ export function renameFolder(id, name) {
     return putFolder(renamed).then(() => renamed);
   });
 }
-
-
 
 export function deleteFolder(id) {
   return listPacks()
@@ -375,75 +416,107 @@ export function reorderFolders(folderIds) {
   });
 }
 
+/**
+ * Write new placements for exactly the packs named, and nothing else.
+ *
+ * Each pack row is read and put inside the one transaction, and the index entry
+ * is patched from the row that is already there rather than rebuilt — the search
+ * text of a fifty-page save does not change when the save is dragged one slot.
+ */
+function placePacks(placements) {
+  if (!placements.length) return Promise.resolve();
+  return runTransaction(["packs", "packIndex"], "readwrite", (transaction) => {
+    const packStore = transaction.objectStore("packs");
+    const packIndexStore = transaction.objectStore("packIndex");
+    for (const { id, folderId, sortOrder } of placements) {
+      packStore.get(id).onsuccess = (event) => {
+        const pack = event.target.result;
+        if (!pack) return;
+        packStore.put({ ...pack, folderId, sortOrder });
+      };
+      packIndexStore.get(id).onsuccess = (event) => {
+        const summary = event.target.result;
+        if (summary) packIndexStore.put({ ...summary, folderId, sortOrder });
+      };
+    }
+  });
+}
+
+/** Renumber a whole folder 0..n-1 in the given order, writing only rows that change. */
+function renumberPlacements(orderedPacks, folderId) {
+  return orderedPacks
+    .map((pack, index) => ({ id: pack.id, folderId, sortOrder: index }))
+    .filter((placement, index) => {
+      const pack = orderedPacks[index];
+      return normalizeFolderId(pack.folderId) !== folderId || packSortValue(pack) !== placement.sortOrder;
+    });
+}
+
+/**
+ * Move a pack to the top of another folder.
+ *
+ * One row changes: the pack takes a sort value just below the folder's current
+ * first item, so the rest of the folder keeps the numbers it has. This used to
+ * renumber both folders and write every pack in each — for a move between two
+ * folders of large saves that was hundreds of megabytes copied to change one
+ * field on one row.
+ */
 export function movePack(id, folderId) {
   const targetFolderId = normalizeFolderId(folderId);
   return listPacks().then((summaries) => {
     const sourceSummary = summaries.find((pack) => pack.id === id);
     if (!sourceSummary) throw new Error("Saved pack not found.");
-    const sourceFolderId = normalizeFolderId(sourceSummary.folderId);
-    if (sourceFolderId === targetFolderId) return;
-
-    const targetIds = [id, ...orderedPackIdsFor(summaries, targetFolderId).filter((packId) => packId !== id)];
-    const sourceIds = orderedPackIdsFor(summaries, sourceFolderId).filter((packId) => packId !== id);
-    const affectedIds = [...new Set([...targetIds, ...sourceIds])];
-    return Promise.all(affectedIds.map((packId) => getPack(packId))).then((packs) => {
-      const packsById = new Map(packs.filter(Boolean).map((pack) => [pack.id, pack]));
-      if (!packsById.has(id)) throw new Error("Saved pack not found.");
-      const targetOrder = new Map(targetIds.map((packId, index) => [packId, index]));
-      const sourceOrder = new Map(sourceIds.map((packId, index) => [packId, index]));
-      return runTransaction(["packs", "packIndex"], "readwrite", (transaction) => {
-        const packStore = transaction.objectStore("packs");
-        const packIndexStore = transaction.objectStore("packIndex");
-        affectedIds.forEach((packId) => {
-          const pack = packsById.get(packId);
-          if (!pack) return;
-          const updatedPack = targetOrder.has(packId)
-            ? { ...pack, folderId: targetFolderId, sortOrder: targetOrder.get(packId) }
-            : { ...pack, folderId: sourceFolderId, sortOrder: sourceOrder.get(packId) };
-          packStore.put(updatedPack);
-          packIndexStore.put(packSummary(updatedPack));
-        });
-      });
-    });
+    if (normalizeFolderId(sourceSummary.folderId) === targetFolderId) return;
+    const [first] = orderedPacksFor(summaries, targetFolderId).filter((pack) => pack.id !== id);
+    const sortOrder = first ? Math.min(packSortValue(first), 0) - 1 : 0;
+    return placePacks([{ id, folderId: targetFolderId, sortOrder }]);
   });
 }
 
+/**
+ * Drop a pack at a position in a folder, given the folder's intended order.
+ *
+ * When only the dropped pack has moved — which is what a drag produces — it takes
+ * a sort value between its two new neighbours and is the only row written. If the
+ * requested order differs elsewhere, or the neighbours have no room between them,
+ * the folder is renumbered, still writing only the rows whose value changes.
+ */
 export function moveAndReorderPack(id, folderId, orderedIds) {
   const targetFolderId = normalizeFolderId(folderId);
   return listPacks().then((summaries) => {
     const sourceSummary = summaries.find((pack) => pack.id === id);
     if (!sourceSummary) throw new Error("Saved pack not found.");
-    const sourceFolderId = normalizeFolderId(sourceSummary.folderId);
-    const targetExistingIds = orderedPackIdsFor(summaries, targetFolderId);
-    if (!targetExistingIds.includes(id)) targetExistingIds.unshift(id);
+    const byId = new Map(summaries.map((pack) => [pack.id, pack]));
+    const targetExisting = orderedPacksFor(summaries, targetFolderId).filter((pack) => pack.id !== id);
+    const targetExistingIds = [id, ...targetExisting.map((pack) => pack.id)];
     const requestedIds = Array.isArray(orderedIds) && orderedIds.includes(id)
       ? orderedIds
       : [id, ...(Array.isArray(orderedIds) ? orderedIds : [])];
     const targetIds = completeKnownOrder(requestedIds, targetExistingIds);
-    const sourceIds = sourceFolderId === targetFolderId
-      ? []
-      : orderedPackIdsFor(summaries, sourceFolderId).filter((packId) => packId !== id);
-    const affectedIds = [...new Set([...targetIds, ...sourceIds])];
-
-    return Promise.all(affectedIds.map((packId) => getPack(packId))).then((packs) => {
-      const packsById = new Map(packs.filter(Boolean).map((pack) => [pack.id, pack]));
-      if (!packsById.has(id)) throw new Error("Saved pack not found.");
-      const targetOrder = new Map(targetIds.map((packId, index) => [packId, index]));
-      const sourceOrder = new Map(sourceIds.map((packId, index) => [packId, index]));
-      return runTransaction(["packs", "packIndex"], "readwrite", (transaction) => {
-        const packStore = transaction.objectStore("packs");
-        const packIndexStore = transaction.objectStore("packIndex");
-        affectedIds.forEach((packId) => {
-          const pack = packsById.get(packId);
-          if (!pack) return;
-          const updatedPack = targetOrder.has(packId)
-            ? { ...pack, folderId: targetFolderId, sortOrder: targetOrder.get(packId) }
-            : { ...pack, folderId: sourceFolderId, sortOrder: sourceOrder.get(packId) };
-          packStore.put(updatedPack);
-          packIndexStore.put(packSummary(updatedPack));
-        });
-      });
-    });
+    const others = targetIds.filter((packId) => packId !== id);
+    const onlyThisMoved = others.every((packId, index) => packId === targetExisting[index]?.id);
+    const position = targetIds.indexOf(id);
+    if (onlyThisMoved) {
+      const before = position > 0 ? byId.get(targetIds[position - 1]) : null;
+      const after = position < targetIds.length - 1 ? byId.get(targetIds[position + 1]) : null;
+      const lower = before ? packSortValue(before) : null;
+      const upper = after ? packSortValue(after) : null;
+      let sortOrder = null;
+      if (lower === null && upper === null) sortOrder = 0;
+      else if (lower === null) sortOrder = Math.min(upper, 0) - 1;
+      else if (upper === null) sortOrder = lower + 1;
+      else if (upper - lower > MIN_SORT_GAP) sortOrder = lower + (upper - lower) / 2;
+      if (sortOrder !== null && Number.isFinite(sortOrder)) {
+        // Dropped back where it already was: the value it has already sits
+        // between its neighbours, so there is nothing to write.
+        const current = packSortValue(sourceSummary);
+        const alreadyPlaced = normalizeFolderId(sourceSummary.folderId) === targetFolderId
+          && (lower === null || current > lower) && (upper === null || current < upper);
+        return alreadyPlaced ? undefined : placePacks([{ id, folderId: targetFolderId, sortOrder }]);
+      }
+    }
+    const orderedPacks = targetIds.map((packId) => byId.get(packId)).filter(Boolean);
+    return placePacks(renumberPlacements(orderedPacks, targetFolderId));
   });
 }
 
@@ -463,6 +536,72 @@ export function listCaptures() {
 export function deleteCapture(id) {
   return runStoreRequest("captures", "readwrite", (store) => store.delete(id));
 }
+
+/* ------------------------------------------------------------------ *
+ * Reading state and thumbnails
+ * ------------------------------------------------------------------ */
+
+function normalizeReadingState(packId, state) {
+  return {
+    packId,
+    lastOpenedAt: Number(state?.lastOpenedAt) || 0,
+    pageIndex: Math.max(0, Number(state?.pageIndex) || 0),
+    scroll: state?.scroll && typeof state.scroll === "object" ? state.scroll : {},
+    opened: state?.opened && typeof state.opened === "object" ? state.opened : {},
+  };
+}
+
+export function getReadingState(packId) {
+  return runStoreRequest("reading", "readonly", (store) => store.get(packId))
+    .then((state) => (state ? normalizeReadingState(packId, state) : null));
+}
+
+/**
+ * Merge a change into a pack's reading state. `pageIndex` is where the reader is,
+ * `scrollTop` is how far down that page, and both are kept per page so coming
+ * back to any page of a save lands where it was left.
+ */
+export function putReadingState(packId, patch = {}) {
+  return runTransaction(["reading"], "readwrite", (transaction) => {
+    const store = transaction.objectStore("reading");
+    store.get(packId).onsuccess = (event) => {
+      const current = normalizeReadingState(packId, event.target.result);
+      const pageIndex = Number.isInteger(patch.pageIndex) ? patch.pageIndex : current.pageIndex;
+      const next = {
+        ...current,
+        pageIndex,
+        lastOpenedAt: Number(patch.lastOpenedAt) || Date.now(),
+        opened: { ...current.opened, [pageIndex]: true },
+        scroll: { ...current.scroll },
+      };
+      if (Number.isFinite(Number(patch.scrollTop))) next.scroll[pageIndex] = Math.max(0, Math.round(Number(patch.scrollTop)));
+      store.put(next);
+    };
+  });
+}
+
+/** Every pack's reading state, keyed by pack id. Small: one short row per pack ever opened. */
+export function listReadingStates() {
+  return runStoreRequest("reading", "readonly", (store) => store.getAll())
+    .then((states) => Object.fromEntries((Array.isArray(states) ? states : [])
+      .map((state) => [state.packId, normalizeReadingState(state.packId, state)])));
+}
+
+export function putThumbnail(id, dataUrl) {
+  if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) return Promise.resolve();
+  return runStoreRequest("thumbnails", "readwrite", (store) => store.put({ id, dataUrl, capturedAt: Date.now() }));
+}
+
+/** Thumbnails for the given pack ids, keyed by id; packs without one are absent. */
+export function getThumbnails(ids) {
+  const wanted = [...new Set((Array.isArray(ids) ? ids : []).filter(Boolean))];
+  return Promise.all(wanted.map((id) => runStoreRequest("thumbnails", "readonly", (store) => store.get(id))))
+    .then((rows) => Object.fromEntries(rows.filter(Boolean).map((row) => [row.id, row.dataUrl])));
+}
+
+/* ------------------------------------------------------------------ *
+ * Journeys and settings
+ * ------------------------------------------------------------------ */
 
 function journeySummary(journey) {
   const queueState = journeyQueueSummary(journey);

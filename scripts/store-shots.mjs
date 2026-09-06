@@ -978,18 +978,27 @@ async function library(page) {
   return reply.packs;
 }
 
-/** The frame the saved page is rendered in. Sandboxed, so it has its own document. */
-function savedPageFrame(reader) {
-  const found = reader.frames().find((candidate) => /sandbox\.html/.test(candidate.url()));
-  if (!found) throw new Error('the reader has no sandboxed page frame');
-  return found;
+/**
+ * The frame the saved page is rendered in. Sandboxed, so it has its own document.
+ *
+ * Looked for over a moment rather than on the first tick: the reader reveals
+ * itself when the sandbox reports the page rendered, and Playwright's record of
+ * the frame's address can lag that message by a few milliseconds on a page that
+ * carried forty files. A frame that never turns up is still an error.
+ */
+async function savedPageFrame(reader) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const found = reader.frames().find((candidate) => /sandbox\.html/.test(candidate.url()));
+    if (found) return found;
+    await wait(100);
+  }
+  throw new Error('the reader has no sandboxed page frame');
 }
 
 /** How many links the reader marked as opening from disk. */
-function savedLinkCount(reader) {
-  return savedPageFrame(reader).evaluate(
-    () => document.querySelectorAll('a[data-pagepack-saved-link="true"]').length,
-  );
+async function savedLinkCount(reader) {
+  const frame = await savedPageFrame(reader);
+  return frame.evaluate(() => document.querySelectorAll('a[data-pagepack-saved-link="true"]').length);
 }
 
 /**
@@ -1002,7 +1011,7 @@ function savedLinkCount(reader) {
  * image icon in it.
  */
 async function reportImages(reader, label) {
-  const saved = savedPageFrame(reader);
+  const saved = await savedPageFrame(reader);
   await saved.evaluate(() =>
     Promise.all([...document.images].map((image) => image.decode().catch(() => undefined))),
   );
@@ -1070,10 +1079,31 @@ async function savePage(context, extensionId, tab, url, { depth = 0, folder = 'L
   await setDepth(popup, depth);
   const before = (await library(popup)).length;
   await popup.click('#save-button');
+  /**
+   * A save that follows links goes through the pre-flight sheet first: the
+   * extension finds the same-site pages, says how many and roughly how much,
+   * and only saves once that is confirmed. The sheet is confirmed here as a
+   * user would, with everything it found left ticked, and what it said is
+   * printed with the rest of the run.
+   */
+  if (depth > 0) {
+    await popup.waitForSelector('#review-overlay:not([hidden])', { timeout: 60000 });
+    const preflight = await popup.evaluate(() => ({
+      title: document.getElementById('review-title').textContent,
+      summary: document.getElementById('review-summary').textContent,
+      button: document.getElementById('save-reviewed-button').textContent,
+    }));
+    process.stdout.write(`  pre-flight: ${preflight.title} — ${preflight.summary} [${preflight.button}]
+`);
+    await popup.click('#save-reviewed-button');
+  }
   if (onProgress) await onProgress(popup, tab);
   // Polled from here rather than with `waitForFunction`, because the question is
   // asked over extension messaging and so can only be answered asynchronously.
   const [saved] = await waitForSave(popup, before);
+  // The whole item has to be in the library before the popup goes: the count
+  // moves up as soon as the first page lands.
+  await popup.waitForFunction(() => document.getElementById('save-progress')?.hidden !== false, null, { timeout: 180000 }).catch(() => {});
   await popup.close();
   process.stdout.write(
     `  saved "${saved.title}" — ${saved.stats.pages} page(s), ${saved.stats.resources} file(s), ${saved.stats.failed} issue(s)\n`,

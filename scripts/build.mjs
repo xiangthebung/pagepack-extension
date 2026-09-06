@@ -64,6 +64,7 @@ const RUNTIME_FILES = [
 
   // Shared modules.
   'url-surface.js',
+  'pack-render.js',
   'storage.js',
   'monetization.js',
   'pricing.js',

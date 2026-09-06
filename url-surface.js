@@ -196,7 +196,7 @@ export function auditCss(cssText, element = "css") {
   // `image-set(url("a.png") 1x)` is reported once, by the `url()` rule that owns
   // it, instead of twice. Blanking preserves length, so nothing else shifts.
   const withoutUrlFunctions = css.replace(/url\(\s*(["']?)([^"')]*)\1\s*\)/gi, (match) => " ".repeat(match.length));
-  for (const match of withoutUrlFunctions.matchAll(/(?:-webkit-)?image-set\(([^)]*(?:\([^)]*\)[^)]*)*)\)/gi)) {
+  for (const match of withoutUrlFunctions.matchAll(/(?:-webkit-)?image-set\(([^()]*(?:\([^()]*\)[^()]*)*)\)/gi)) {
     for (const candidate of match[1].matchAll(/(["'])([^"']+)\1/g)) {
       if (!isInertReference(candidate[2])) findings.push({ construct: "css:image-set()", element, value: candidate[2], reason: "loads an image" });
     }
@@ -210,7 +210,7 @@ export function auditCss(cssText, element = "css") {
  * here, and only inside an `image-set()`.
  */
 export function rewriteImageSet(cssText, collect, baseUrl) {
-  return String(cssText ?? "").replace(/((?:-webkit-)?image-set\()([^)]*(?:\([^)]*\)[^)]*)*)(\))/gi, (full, open, body, close) => {
+  return String(cssText ?? "").replace(/((?:-webkit-)?image-set\()([^()]*(?:\([^()]*\)[^()]*)*)(\))/gi, (full, open, body, close) => {
     const rewritten = body.replace(/(["'])([^"']+)\1/g, (quoted, quote, value) => {
       if (isInertReference(value)) return quoted;
       const token = collect(value.trim(), "asset", baseUrl);

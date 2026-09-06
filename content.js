@@ -35,7 +35,7 @@ function replaceCssUrls(cssText, collect, baseUrl) {
   // `url-surface.js`; the service worker imports that copy, an injected script
   // cannot import anything, and `tests/offline-guarantee.test.mjs` renders a page
   // through this file in a real browser so the two cannot quietly disagree.
-  return withUrls.replace(/((?:-webkit-)?image-set\()([^)]*(?:\([^)]*\)[^)]*)*)(\))/gi, (full, open, body, close) => {
+  return withUrls.replace(/((?:-webkit-)?image-set\()([^()]*(?:\([^()]*\)[^()]*)*)(\))/gi, (full, open, body, close) => {
     const rewritten = body.replace(/(["'])([^"']+)\1/g, (quoted, quote, value) => {
       if (/^(data|blob):/i.test(value) || value.startsWith("#") || /^__PAGEPACK_RESOURCE_\d+__$/.test(value)) return quoted;
       const token = collect(value.trim(), "asset", baseUrl);
@@ -89,6 +89,62 @@ function rewriteSrcset(value, collect, baseUrl) {
     output += source.slice(descriptorStart, index);
   }
   return output;
+}
+
+/**
+ * The site icon, from the live document. A `<link rel="icon">` if the page
+ * declares one, else the conventional `/favicon.ico`; the service worker fetches
+ * it and keeps a small copy so the library and the reader tab can show it.
+ */
+function faviconUrl() {
+  const links = [...document.querySelectorAll('link[rel~="icon" i], link[rel~="apple-touch-icon" i]')];
+  const declared = links.find((link) => link.matches('[rel~="icon" i]') && isHttpUrl(link.href))
+    || links.find((link) => isHttpUrl(link.href));
+  if (declared) return declared.href;
+  try {
+    return new URL("/favicon.ico", location.href).href;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * What a linked save would take, read cheaply from the live page: every link on
+ * it, and a measure of what this page itself weighed when it loaded. The
+ * service worker keeps the links that are on the same site and turns the sizes
+ * into an estimate for the pre-flight sheet. Nothing here clones the document.
+ */
+function describeLinks() {
+  const links = [];
+  const seen = new Set();
+  for (const anchor of document.querySelectorAll("a[href]")) {
+    const href = canonicalUrl(anchor.getAttribute("href"));
+    if (!isHttpUrl(href) || seen.has(href)) continue;
+    seen.add(href);
+    const text = String(anchor.textContent || anchor.getAttribute("aria-label") || anchor.title || "").replace(/\s+/g, " ").trim();
+    links.push({ href, text: text.slice(0, 120) });
+    if (links.length >= 400) break;
+  }
+  let resourceBytes = 0;
+  let resourceCount = 0;
+  try {
+    for (const entry of performance.getEntriesByType("resource")) {
+      resourceCount += 1;
+      resourceBytes += Number(entry.decodedBodySize || entry.encodedBodySize || entry.transferSize || 0);
+    }
+  } catch {
+    // Timing entries are a measurement aid, not a requirement.
+  }
+  return {
+    url: canonicalUrl(location.href),
+    title: document.title || canonicalUrl(location.href),
+    favicon: faviconUrl(),
+    links,
+    htmlLength: document.documentElement?.outerHTML?.length || 0,
+    imageCount: document.images.length,
+    resourceCount,
+    resourceBytes,
+  };
 }
 
 function prepareDocument(options) {
@@ -223,6 +279,7 @@ function prepareDocument(options) {
   return {
     url: pageUrl,
     title: document.title || pageUrl,
+    favicon: faviconUrl(),
     resources,
     html: `<!doctype html>\n${clone.outerHTML}`,
   };
@@ -233,7 +290,7 @@ async function capturePage(request) {
   const port = chrome.runtime.connect({ name: "pagepack-capture" });
   let disconnected = false;
   port.onDisconnect.addListener(() => { disconnected = true; });
-  port.postMessage({ type: "capture-start", requestId: request.requestId, meta: { url: payload.url, title: payload.title, resources: payload.resources } });
+  port.postMessage({ type: "capture-start", requestId: request.requestId, meta: { url: payload.url, title: payload.title, favicon: payload.favicon, resources: payload.resources } });
   for (let index = 0; index < payload.html.length; index += HTML_CHUNK_SIZE) {
     if (disconnected) return;
     port.postMessage({ type: "capture-chunk", requestId: request.requestId, chunk: payload.html.slice(index, index + HTML_CHUNK_SIZE) });
@@ -246,6 +303,14 @@ async function capturePage(request) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "PAGEPACK_LINKS_REQUEST") {
+    try {
+      sendResponse({ accepted: true, ...describeLinks() });
+    } catch (error) {
+      sendResponse({ accepted: false, error: error.message });
+    }
+    return false;
+  }
   if (message?.type !== "PAGEPACK_CAPTURE_REQUEST") return false;
   sendResponse({ accepted: true });
   capturePage(message).catch((error) => {

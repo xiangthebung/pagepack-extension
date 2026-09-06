@@ -43,13 +43,6 @@ html, body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* The reader can open this page in a full tab; present it as a centred panel
-   there instead of a 400px block pinned to the corner. */
-@media (min-width: 520px) {
-  html { height: auto; min-height: 100vh; overflow: auto; padding: 28px 0; }
-  body { margin: 0 auto; border-radius: 18px; box-shadow: var(--shadow-pop); }
-}
-
 h1 { margin: 0; font-size: 21px; line-height: 1.2; font-weight: 680; letter-spacing: -.022em; }
 p { margin: 0; }
 button, input, select { font: inherit; color: inherit; }
@@ -249,6 +242,8 @@ body.is-overlay-open .view-panel { overflow: hidden; }
   font-weight: 620;
 }
 .danger-button:hover:not(:disabled) { background: #e0301f; }
+.danger-button.is-neutral { background: var(--accent); }
+.danger-button.is-neutral:hover:not(:disabled) { background: var(--accent-press); }
 
 /* Secondary and destructive: readable, but never competing with the primary
    action next to it. */
@@ -276,6 +271,47 @@ body.is-overlay-open .view-panel { overflow: hidden; }
   font-weight: 600;
 }
 .link-button:hover { text-decoration: underline; }
+
+.inline-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent-text);
+  font-size: inherit;
+  font-weight: 600;
+}
+.inline-link:hover { text-decoration: underline; }
+
+.save-hint {
+  margin: 4px 2px 0;
+  color: var(--tertiary);
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+}
+.save-hint:empty { display: none; }
+
+.saved-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  margin: -4px 0 0;
+  color: var(--secondary);
+  font-size: 12px;
+}
+
+kbd {
+  padding: 1px 4px;
+  border: .5px solid var(--separator-strong);
+  border-bottom-width: 1.5px;
+  border-radius: 4px;
+  background: var(--surface);
+  font: inherit;
+  font-size: 11px;
+}
 
 button.is-loading::before {
   content: "";
@@ -343,6 +379,13 @@ button.is-loading::before {
 .progress-bar.is-indeterminate span {
   width: 36%;
   animation: pagepack-slide 1.3s ease-in-out infinite;
+}
+.progress-meter {
+  margin-top: -2px;
+  color: var(--secondary);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 .progress-hint { color: var(--tertiary); font-size: 12px; line-height: 1.4; }
 
@@ -555,6 +598,8 @@ button.is-loading::before {
   font-size: 12px;
 }
 .local-note svg { width: 13px; height: 13px; flex: 0 0 auto; }
+.local-note > span { line-height: 1.5; }
+.shortcut-keys { white-space: nowrap; }
 
 /* ----------------------------------------------------------------- *
  * Library
@@ -579,6 +624,37 @@ button.is-loading::before {
 .back-button:hover { background: var(--accent-soft); }
 .back-button svg { width: 15px; height: 15px; }
 .library-title-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.library-title-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.library-page-only { display: none; }
+.storage-line {
+  display: grid;
+  gap: 5px;
+  margin-top: 2px;
+  color: var(--tertiary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.storage-bar {
+  display: none;
+  position: relative;
+  height: 5px;
+  max-width: 320px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-muted);
+}
+.storage-bar span { position: absolute; inset: 0 auto 0 0; width: 0; min-width: 2px; border-radius: inherit; background: var(--accent); }
+.library-tools { display: flex; justify-content: space-between; gap: 8px; }
+.tool-field { display: block; min-width: 0; flex: 1; }
+.tool-field select {
+  width: 100%;
+  min-height: 32px;
+  padding: 0 8px;
+  border: .5px solid var(--separator-strong);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  font-size: 12px;
+}
 .library-title-row h1 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .library-subtitle { color: var(--tertiary); font-size: 12px; }
 .library-count { color: var(--tertiary); font-size: 12px; }
@@ -718,6 +794,26 @@ button.is-loading::before {
   color: var(--accent-text);
 }
 .entry-icon svg { width: 20px; height: 20px; }
+.entry-icon img { width: 18px; height: 18px; border-radius: 4px; object-fit: contain; }
+.entry-thumb {
+  display: none;
+  width: 124px;
+  height: 78px;
+  border-radius: 9px;
+  object-fit: cover;
+  object-position: top;
+  background: var(--surface-muted);
+  box-shadow: 0 0 0 .5px var(--separator);
+}
+.unread-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin: 0 6px 1px 0;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: middle;
+}
 .folder-entry .entry-icon { background: rgba(255, 149, 0, .14); color: #a05a00; }
 .entry-copy { display: grid; gap: 2px; min-width: 0; }
 .entry-title {
@@ -948,6 +1044,13 @@ body.is-reordering, body.is-reordering * { cursor: grabbing !important; user-sel
 .issue-actions { display: flex; gap: 6px; margin-top: 2px; }
 .issues-more { color: var(--tertiary); font-size: 12px; }
 
+.review-note {
+  margin-top: -4px;
+  color: var(--secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.review-note.is-warning { color: var(--warn-text); }
 .review-row {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr);
@@ -992,6 +1095,42 @@ body.is-reordering, body.is-reordering * { cursor: grabbing !important; user-sel
 }
 
 /* ----------------------------------------------------------------- *
+ * Library as a page
+ * ----------------------------------------------------------------- */
+
+/* The library opens in a full tab from the reader's Library button. Anything
+   wider than the popup is that page: the panel widens to a column, the Save
+   tab goes away — this tab has no page to save — and the rows gain the room
+   for a picture of the page. This block sits after every rule it overrides:
+   the media query adds no specificity, so order is what makes it win. */
+@media (min-width: 520px) {
+  html, body { width: auto; height: auto; min-height: 100vh; overflow: auto; }
+  .app { max-width: 1040px; height: auto; min-height: 100vh; margin: 0 auto; padding: 0 28px 48px; }
+  .app-header { padding: 26px 0 12px; }
+  .brand-mark { width: 40px; height: 40px; border-radius: 12px; }
+  .brand-copy strong { font-size: 16px; }
+  .tabs { display: none; }
+  .view-panel { overflow: visible; padding: 10px 0 0; }
+  .library-head { gap: 6px; }
+  .library-title-row h1 { font-size: 26px; }
+  .library-page-only { display: inline-flex; align-items: center; justify-content: center; }
+  .storage-line { display: grid; }
+  .storage-bar { display: block; }
+  .library-tools { justify-content: flex-start; }
+  .tool-field { flex: 0 0 auto; min-width: 170px; }
+  .library-list { gap: 10px; }
+  .entry { padding: 8px 10px 8px 8px; }
+  .entry-open { grid-template-columns: 34px minmax(0, 1fr); min-height: 60px; }
+  .entry-open.has-thumb { grid-template-columns: 124px minmax(0, 1fr); gap: 14px; }
+  .entry-thumb { display: block; }
+  .entry-title { font-size: 14px; }
+  .entry-meta { font-size: 12.5px; }
+  .pages-panel { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+  .sheet { max-width: 560px; }
+  .empty-state { padding-top: 80px; }
+}
+
+/* ----------------------------------------------------------------- *
  * Dark mode
  * ----------------------------------------------------------------- */
 
@@ -1032,4 +1171,5 @@ body.is-reordering, body.is-reordering * { cursor: grabbing !important; user-sel
   .pro-card { background: linear-gradient(150deg, var(--accent-soft), rgba(42, 42, 44, .8) 60%); }
   .folder-entry .entry-icon { background: rgba(255, 159, 10, .2); color: #ffb340; }
   .primary-button { box-shadow: none; }
+  kbd { background: var(--surface-muted); }
 }

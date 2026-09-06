@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>PagePack</title>
+    <link rel="icon" href="icons/icon-32.png">
     <link rel="stylesheet" href="popup.css">
   </head>
   <body>
@@ -44,8 +45,17 @@
             </span>
           </div>
 
+          <p id="saved-notice" class="saved-notice" hidden>
+            <span id="saved-notice-text">Saved 2 h ago</span>
+            <span aria-hidden="true"> · </span>
+            <button id="saved-open-button" class="inline-link" type="button">Open</button>
+            <span aria-hidden="true"> / </span>
+            <button id="saved-again-button" class="inline-link" type="button">Save again</button>
+          </p>
+
           <div id="save-action" class="save-action">
             <button id="save-button" class="primary-button" type="button">Save page</button>
+            <p id="save-hint" class="save-hint"></p>
             <button id="quota-upgrade-button" class="link-button" type="button" hidden>See PagePack Pro</button>
           </div>
 
@@ -57,6 +67,7 @@
             <div id="progress-bar" class="progress-bar" role="progressbar" aria-labelledby="progress-title" aria-valuemin="0" aria-valuemax="100">
               <span id="progress-fill"></span>
             </div>
+            <p id="progress-meter" class="progress-meter" hidden></p>
             <p class="progress-hint">You can close this window — saving continues in the background.</p>
             <button id="cancel-save-button" class="quiet-danger-button" type="button">Cancel save</button>
           </section>
@@ -83,6 +94,17 @@
             <span class="option-copy">
               <strong>Save as I browse</strong>
               <small>Collect the pages you visit into one save</small>
+            </span>
+            <span class="option-chevron" aria-hidden="true"></span>
+          </button>
+
+          <button id="tabs-start-button" class="option-row" type="button">
+            <span class="option-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false"><path d="M4.5 8.5h11v11h-11zM8.5 4.5h11v11"/></svg>
+            </span>
+            <span class="option-copy">
+              <strong>Save all tabs in this window</strong>
+              <small>Each open tab becomes its own save</small>
             </span>
             <span class="option-chevron" aria-hidden="true"></span>
           </button>
@@ -115,7 +137,7 @@
               <div class="setting-row">
                 <label class="option-copy" for="depth-select">
                   <strong>Linked pages</strong>
-                  <small>Also save pages linked from this one, on the same site</small>
+                  <small>Also save pages linked from this one, on the same site. You choose which before anything is saved.</small>
                 </label>
                 <select id="depth-select">
                   <option value="0">Just this page</option>
@@ -170,7 +192,7 @@
 
           <p class="local-note">
             <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 7V5.5a3.5 3.5 0 0 1 7 0V7M3 7h10v7H3z"/></svg>
-            Everything you save stays on this device.
+            <span>Everything you save stays on this device. <span class="shortcut-keys"><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd></span> saves the current page.</span>
           </p>
         </section>
 
@@ -182,11 +204,18 @@
             </button>
             <div class="library-title-row">
               <h1 id="library-title">Library</h1>
-              <button id="new-folder-button" class="icon-button" type="button" aria-label="New folder" title="New folder">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h7l2-2h8v14h-17zM12 11v5m-2.5-2.5h5"/></svg>
-              </button>
+              <div class="library-title-actions">
+                <button id="library-save-tabs-button" class="small-quiet library-page-only" type="button" hidden>Save all open tabs</button>
+                <button id="new-folder-button" class="icon-button" type="button" aria-label="New folder" title="New folder">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h7l2-2h8v14h-17zM12 11v5m-2.5-2.5h5"/></svg>
+                </button>
+              </div>
             </div>
             <p id="library-subtitle" class="library-subtitle">Private, on this device, ready offline.</p>
+            <div id="storage-line" class="storage-line" hidden>
+              <span id="storage-text">Library: 0 B</span>
+              <span class="storage-bar" aria-hidden="true"><span id="storage-fill"></span></span>
+            </div>
           </div>
 
           <form id="new-folder-form" class="new-folder-form" hidden>
@@ -205,6 +234,30 @@
             </button>
           </div>
 
+          <div class="library-tools">
+            <label class="tool-field">
+              <span class="visually-hidden">Sort saves</span>
+              <select id="library-sort" aria-label="Sort saves">
+                <option value="manual">Your order</option>
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="title">Title A–Z</option>
+                <option value="largest">Largest first</option>
+              </select>
+            </label>
+            <label class="tool-field">
+              <span class="visually-hidden">Show</span>
+              <select id="library-filter" aria-label="Show">
+                <option value="all">All saves</option>
+                <option value="unread">Unread</option>
+                <option value="multi">Multi-page</option>
+                <option value="journey">Collections</option>
+                <option value="issues">Missing parts</option>
+              </select>
+            </label>
+          </div>
+
+          <p id="library-status" class="status-message" role="status" aria-live="polite"></p>
           <p id="library-count" class="library-count" role="status" aria-live="polite"></p>
           <div id="library-list" class="library-list" role="list"></div>
           <p id="reorder-status" class="visually-hidden" role="status" aria-live="polite"></p>
@@ -272,23 +325,27 @@
         </section>
       </div>
 
+      <!-- One sheet, three jobs: reviewing a collection before it is saved,
+           choosing the linked pages a save will take, and picking which open
+           tabs to save. The copy and the rows change; the shape does not. -->
       <div id="review-overlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="review-title" hidden>
         <div class="scrim" data-close-overlay="review"></div>
         <section class="sheet">
           <div class="sheet-head">
             <div>
-              <p class="sheet-kicker">BEFORE SAVING</p>
+              <p id="review-kicker" class="sheet-kicker">BEFORE SAVING</p>
               <h1 id="review-title">Choose what to keep</h1>
             </div>
-            <button id="close-review-button" class="icon-button" type="button" aria-label="Keep browsing">
+            <button id="close-review-button" class="icon-button" type="button" aria-label="Cancel">
               <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8"/></svg>
             </button>
           </div>
           <p id="review-summary" class="sheet-summary"></p>
+          <p id="review-note" class="review-note" hidden></p>
           <div id="review-list" class="review-list"></div>
           <div class="sheet-actions">
             <button id="save-reviewed-button" class="primary-button" type="button">Save selected pages</button>
-            <button id="keep-browsing-button" class="link-button" type="button">Keep browsing</button>
+            <button id="keep-browsing-button" class="link-button" type="button">Cancel</button>
           </div>
         </section>
       </div>
