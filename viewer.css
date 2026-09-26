@@ -239,11 +239,14 @@ svg { display: block; fill: none; stroke: currentColor; stroke-linecap: round; s
   backdrop-filter: blur(20px);
 }
 /* Both notices sit inside the stage, which starts under the bar and beside
-   the sidebar, so neither can land on top of the page list. */
+   the sidebar, so neither can land on top of the page list. The toast shows
+   on every open, so it sits at the foot of the stage: the top is where the
+   saved page keeps its own masthead. */
 .reader-toast {
-  top: 12px;
+  bottom: 14px;
   left: 14px;
   display: flex;
+  max-width: calc(100% - 28px);
   align-items: center;
   gap: 7px;
   padding: 8px 12px;
